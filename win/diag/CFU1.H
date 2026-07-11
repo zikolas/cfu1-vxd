@@ -34,6 +34,13 @@
 #define CFU_IOSREG      0x101A  /* register with IOS; out: DWORD reg_result */
 #define CFU_IOSSTAT     0x101B  /* out: total, lastfunc, regresult, cnt[16] */
 #define CFU_MSCMOUNT    0x101C  /* ring-0 enumerate; out: blocks, block_size*/
+#define CFU_IORSTAT     0x101D  /* out: total, last, isp, cfgdcb, inqdcb,
+                                   cnt[48]                                  */
+#define CFU_PEEK        0x101E  /* in: DWORD addr, DWORD len(<=256); out raw*/
+#define CFU_DCBENUM     0x101F  /* out: DWORD count + up to 15 DCB addrs    */
+#define CFU_IOSCFG      0x1020  /* broadcast AEP_CONFIG_DCB; out: results   */
+#define CFU_IOSVOL      0x1021  /* create logical vol DCB + associate;
+                                   out: DWORD (create<<16)|assoc            */
 
 #pragma pack(push, 1)
 typedef struct {

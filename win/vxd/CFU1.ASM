@@ -30,6 +30,13 @@
         include ilb.inc
         include aep.inc
         include ios.inc
+        include blockdev.inc
+        include ior.inc
+        include ddb.inc
+BDD_BD_Major_Ver equ 4                  ; block-device version (struct defaults)
+BDD_BD_Minor_Ver equ 0
+        include dcb.inc
+        include iop.inc
 
 ;----------------------------------------------------------------------------
 ; ioctl codes (keep in sync with win/diag/CFU1.H)
@@ -66,8 +73,18 @@ CFU_IOSREG      equ 101Ah       ; register with IOS; out: DWORD reg_result
 CFU_IOSSTAT     equ 101Bh       ; out: total, lastfunc, regresult, counts[16]
 CFU_MSCMOUNT    equ 101Ch       ; ring-0 enumerate + READ CAPACITY;
                                 ; out: DWORD blocks, DWORD block_size
+CFU_IORSTAT     equ 101Dh       ; out: ior_total, ior_last, isp_cd_result,
+                                ;      cfg_dcb, inq_dcb, ior_counts[48]
+CFU_PEEK        equ 101Eh       ; in: DWORD linear addr, DWORD len (<=256)
+                                ; out: len raw bytes (ring-0 read)
+CFU_DCBENUM     equ 101Fh       ; out: DWORD count + up to 15 DCB addresses
+CFU_IOSCFG      equ 1020h       ; broadcast AEP_CONFIG_DCB for our DCB to
+                                ; all layer drivers; out: DWORD results
+CFU_IOSVOL      equ 1021h       ; act as our own TSD: parse the MBR, create
+                                ; a logical volume DCB, ISP_ASSOCIATE_DCB.
+                                ; out: DWORD (create_res<<16)|assoc_res
 
-VXD_VERSION     equ 00010803h   ; 1.83 - mount ESI-save fix
+VXD_VERSION     equ 00010908h   ; 1.98 - writeable flags + media checks
 
 HIDRING_SLOTS   equ 32
 HIDSLOT_SIZE    equ 9
@@ -616,6 +633,16 @@ close_keep:
         je      ioc_iosstat
         cmp     eax, CFU_MSCMOUNT
         je      ioc_mscmount
+        cmp     eax, CFU_IORSTAT
+        je      ioc_iorstat
+        cmp     eax, CFU_PEEK
+        je      ioc_peek
+        cmp     eax, CFU_DCBENUM
+        je      ioc_dcbenum
+        cmp     eax, CFU_IOSCFG
+        je      ioc_ioscfg
+        cmp     eax, CFU_IOSVOL
+        je      ioc_iosvol
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -1613,6 +1640,253 @@ ioc_iosstat:
 @@:     xor     eax, eax
         ret
 
+; CFU_IORSTAT: dump the IOR observation counters
+ioc_iorstat:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], 212   ; 5 dwords + 48 counts
+        jb      ioc_badbuf
+        mov     eax, [ior_total]
+        mov     [edx+0], eax
+        mov     eax, [ior_last]
+        mov     [edx+4], eax
+        mov     eax, [isp_cd_result]
+        mov     [edx+8], eax
+        mov     eax, [cfg_dcb_ptr]
+        mov     [edx+12], eax
+        mov     eax, [inq_dcb_ptr]
+        mov     [edx+16], eax
+        push    esi
+        push    edi
+        cld
+        mov     esi, OFFSET32 ior_counts
+        lea     edi, [edx+20]
+        mov     ecx, 48
+        rep     movsd
+        pop     edi
+        pop     esi
+        mov     ecx, [esi.lpcbBytesReturned]
+        test    ecx, ecx
+        jz      @F
+        mov     dword ptr [ecx], 212
+@@:     xor     eax, eax
+        ret
+
+; CFU_PEEK: ring-0 read of linear memory (debug).  in: addr, len (<=256)
+ioc_peek:
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbInBuffer], 8
+        jb      ioc_badbuf
+        mov     eax, [edx+0]            ; source linear address
+        mov     ecx, [edx+4]            ; length
+        cmp     ecx, 256
+        ja      ioc_badbuf
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], ecx
+        jb      ioc_badbuf
+        push    esi
+        push    edi
+        cld
+        mov     esi, eax
+        mov     edi, edx
+        push    ecx
+        rep     movsb
+        pop     ecx
+        pop     edi
+        pop     esi
+        mov     edx, [esi.lpcbBytesReturned]
+        test    edx, edx
+        jz      @F
+        mov     [edx], ecx
+@@:     xor     eax, eax
+        ret
+
+; CFU_DCBENUM: walk all DCBs via ISP_GET_FIRST_NEXT_DCB (needs cfu_ilb from
+; a prior IOS_Register).  out: DWORD count + up to 15 DCB linear addresses.
+ioc_dcbenum:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], 64
+        jb      ioc_badbuf
+        cmp     dword ptr [cfu_ilb], 0  ; ILB filled in by IOS_Register?
+        je      ioc_badbuf
+        push    ebx
+        push    edi
+        mov     ebx, edx                ; EBX = out buffer (callee-saved)
+        mov     dword ptr [ebx], 0      ; count = 0
+        sub     esp, 16                 ; ISP_GET_FRST_NXT_DCB on the stack
+        mov     dword ptr [esp+4], 0    ; dcb_offset = 0 -> first
+denum_loop:
+        mov     word ptr [esp+0], 8     ; ISP_func = ISP_GET_FIRST_NEXT_DCB
+        mov     word ptr [esp+2], 0     ; ISP_result
+        mov     dword ptr [esp+8], 0    ; found_dcb (out)
+        mov     byte ptr [esp+12], 0FFh ; any device type
+        push    esp                     ; -> the ISP (value before push)
+        call    dword ptr [cfu_ilb]
+        add     esp, 4
+        cmp     word ptr [esp+2], 0
+        jne     denum_done
+        mov     eax, [esp+8]
+        test    eax, eax
+        jz      denum_done
+        mov     ecx, [ebx]
+        cmp     ecx, 15
+        jae     denum_done
+        mov     [ebx+4+ecx*4], eax
+        inc     dword ptr [ebx]
+        mov     [esp+4], eax            ; continue from this DCB
+        jmp     denum_loop
+denum_done:
+        add     esp, 16
+        pop     edi
+        pop     ebx
+        mov     ecx, [esi.lpcbBytesReturned]
+        test    ecx, ecx
+        jz      @F
+        mov     dword ptr [ecx], 64
+@@:     xor     eax, eax
+        ret
+
+; CFU_IOSCFG: broadcast AEP_CONFIG_DCB for our claimed DCB so already-
+; registered layer drivers (disk TSD, voltrack) get offered it.  IOS only
+; ran OUR config pass during dynamic registration; the TSD layers never saw
+; the DCB (DCB_DEV_MUST_CONFIGURE still set).  Appy time only - we are in a
+; Win32 DeviceIoControl, which qualifies.
+; out: DWORD = (broadcast ISP_result << 16) | AEP_result after broadcast
+ioc_ioscfg:
+        cmp     dword ptr [cfu_ilb], 0
+        je      ioc_badbuf
+        mov     eax, [cfg_dcb_ptr]
+        test    eax, eax
+        jz      ioc_badbuf
+        push    ebx
+        sub     esp, 16                 ; AEP_dcb_config
+        mov     ebx, esp
+        mov     word ptr [ebx+0], 3     ; AEP_func = AEP_CONFIG_DCB
+        mov     word ptr [ebx+2], 0     ; AEP_result
+        mov     eax, [cfu_ddb_ptr]
+        mov     [ebx+4], eax            ; AEP_ddb
+        mov     byte ptr [ebx+8], 0     ; AEP_lgn (IOS walks the layers)
+        mov     byte ptr [ebx+9], 0
+        mov     word ptr [ebx+10], 0
+        mov     eax, [cfg_dcb_ptr]
+        mov     [ebx+12], eax           ; AEP_d_c_dcb
+        sub     esp, 8                  ; ISP_AEP_BROADCAST
+        mov     word ptr [esp+0], 20    ; ISP_func = ISP_BROADCAST_AEP
+        mov     word ptr [esp+2], 0     ; ISP_result
+        mov     [esp+4], ebx            ; ISP_baep_paep
+        push    esp
+        call    dword ptr [cfu_ilb]
+        add     esp, 4
+        movzx   eax, word ptr [esp+2]   ; broadcast ISP_result
+        shl     eax, 16
+        mov     ax, word ptr [ebx+2]    ; AEP_result after the broadcast
+        add     esp, 8 + 16
+        pop     ebx
+        jmp     ret_dword
+
+; CFU_IOSVOL: act as our own TSD.  DISKTSD never engages a dynamically-
+; registered port driver's DCB (and broadcasting CONFIG_DCB hangs a layer
+; driver), so do the TSD's job ourselves: read the MBR in ring 0, create a
+; logical volume DCB for partition 1, and ISP_ASSOCIATE_DCB - which per the
+; DDK notifies IFSMGR and broadcasts DBT_DEVICEARRIVAL.
+ioc_iosvol:
+        cmp     dword ptr [cfu_ilb], 0
+        je      ioc_notena
+        cmp     dword ptr [cfg_dcb_ptr], 0
+        je      ioc_notena
+        cmp     byte ptr [msc_mounted], 0
+        je      ioc_notena
+        ; 1) MBR -> partition 1 start/length
+        mov     [xbusy], 1
+        push    esi
+        push    edi
+        xor     eax, eax                ; LBA 0
+        mov     ecx, 1                  ; one sector
+        mov     edi, OFFSET32 vol_secbuf
+        call    msc_do_read
+        pop     edi
+        pop     esi
+        mov     [xbusy], 0
+        jc      ioc_notena
+        cmp     word ptr [vol_secbuf+510], 0AA55h
+        jne     ioc_notena
+        mov     eax, dword ptr [vol_secbuf+1BEh+8]
+        mov     [part_start], eax
+        mov     eax, dword ptr [vol_secbuf+1BEh+12]
+        mov     [part_len], eax
+        push    ebx
+        push    edi
+        ; 2) create the logical DCB
+        sub     esp, 12                 ; ISP_dcb_create
+        mov     edi, esp
+        mov     word ptr [edi+0], 1     ; ISP_func = ISP_CREATE_DCB
+        mov     word ptr [edi+2], 0
+        mov     word ptr [edi+4], SIZE DCB
+        mov     dword ptr [edi+6], 0
+        push    edi
+        call    dword ptr [cfu_ilb]
+        mov     ebx, [esp+4+6]          ; ISP_dcb_ptr
+        movzx   edi, word ptr [esp+4+2] ; create ISP_result
+        add     esp, 12 + 4
+        mov     [log_dcb_ptr], ebx
+        shl     edi, 16                 ; result accumulator (create<<16)
+        test    ebx, ebx
+        jz      iov_out
+        ; 3) fill the logical DCB
+        mov     eax, [cfg_dcb_ptr]
+        mov     [ebx+0], eax            ; DCB_physical_dcb -> our physical
+        mov     ecx, [eax+8]
+        mov     [ebx+8], ecx            ; share the physical's calldown chain
+        mov     [eax+10h], ebx          ; phys DCB_next_logical_dcb -> us
+        mov     dword ptr [ebx+1Ch], 10h        ; dmd_small_memory
+        mov     dword ptr [ebx+20h], 4002h      ; DCB_DEV_LOGICAL | WRITEABLE
+        mov     eax, [part_start]
+        mov     [ebx+28h], eax          ; DCB_Partition_Start
+        mov     byte ptr [ebx+3Ch], 9   ; apparent_blk_shift
+        mov     word ptr [ebx+3Eh], 4342h       ; DCB_sig
+        mov     byte ptr [ebx+40h], 0   ; DCB_type_disk
+        mov     dword ptr [ebx + DCB_max_xfer_len], 10000h
+        mov     eax, [part_len]
+        mov     [ebx + DCB_actual_sector_cnt], eax
+        mov     dword ptr [ebx + DCB_actual_sector_cnt + 4], 0
+        mov     dword ptr [ebx + DCB_actual_blk_size], 200h
+        mov     dword ptr [ebx + DCB_actual_head_cnt], 255
+        mov     dword ptr [ebx + DCB_actual_spt], 63
+        push    edx
+        mov     eax, [part_len]
+        xor     edx, edx
+        mov     ecx, 255*63
+        div     ecx
+        pop     edx
+        mov     [ebx + DCB_actual_cyl_cnt], eax
+        ; 4) associate with a drive number (0-based; let IOS pick via 0FFh
+        ;    is not documented, so aim at the first free letter: E: = 4)
+        sub     esp, 12                 ; ISP_dcb_associate
+        mov     word ptr [esp+0], 6     ; ISP_func = ISP_ASSOCIATE_DCB
+        mov     word ptr [esp+2], 0
+        mov     [esp+4], ebx            ; ISP_d_a_dcb = logical DCB
+        mov     byte ptr [esp+8], 4     ; ISP_d_a_drive = E:
+        mov     byte ptr [esp+9], 0     ; ISP_d_a_flags
+        mov     word ptr [esp+10], 0
+        push    esp
+        call    dword ptr [cfu_ilb]
+        add     esp, 4
+        movzx   eax, word ptr [esp+2]   ; associate ISP_result
+        add     esp, 12
+        or      edi, eax
+iov_out:
+        mov     eax, edi                ; (create<<16) | associate
+        pop     edi
+        pop     ebx
+        jmp     ret_dword
+
 ; CFU_MSCMOUNT: enumerate + read capacity in ring 0; out: blocks, block_size
 ioc_mscmount:
         cmp     [enabled], 0
@@ -1944,7 +2218,20 @@ ios_regresult   dd      0
 aep_total       dd      0
 aep_lastfunc    dd      0
 cfu_ddb_ptr     dd      0               ; DDB IOS allocated for us
+inq_claimed     db      0               ; have we claimed our one device?
+                db      3 dup (0)
 aep_counts      dd      32 dup (0)
+ior_total       dd      0               ; requests seen by CFU1_IosReq
+ior_last        dd      0               ; last IOR_func seen
+isp_cd_result   dd      0FFFFFFFFh      ; ISP_result of the calldown insert
+cfg_dcb_ptr     dd      0               ; DCB from the last AEP_CONFIG_DCB
+inq_dcb_ptr     dd      0               ; DCB from the last AEP_DEVICE_INQUIRY
+cd_inserted_dcb dd      0               ; DCB our calldown is already on
+log_dcb_ptr     dd      0               ; logical volume DCB we created
+part_start      dd      0               ; first partition start LBA (from MBR)
+part_len        dd      0               ; first partition length in sectors
+vol_secbuf      db      512 dup (0)     ; MBR parse buffer
+ior_counts      dd      48 dup (0)      ; per-IOR_func counters (0..2Fh)
 CFU_DDB_SIZE    equ     32              ; = size DDB (header only)
 VxD_LOCKED_DATA_ENDS
 
@@ -1975,16 +2262,38 @@ BeginProc CFU1_IosAer
         cmp     eax, 2                  ; AEP_BOOT_COMPLETE
         je      aer_ok
         cmp     eax, 3                  ; AEP_CONFIG_DCB
-        je      aer_ok
+        je      aer_cfg
+        cmp     eax, 16                 ; AEP_DCB_LOCK / MOUNT_NOTIFY /
+        jb      @F                      ; CREATE_VRP arrive while a volume
+        cmp     eax, 19                 ; on our DCB mounts - acknowledge
+        jbe     aer_ok                  ; them (16..19 incl DESTROY_VRP)
+@@:
         mov     word ptr [ebx+2], 0FFFFh ; default: AEP_FAILURE
         jmp     aer_out
 aer_init:
         call    ios_create_ddb
         jc      aer_fail
-        mov     word ptr [ebx+2], 0     ; AEP_SUCCESS
+        push    ebx                     ; msc_mount trashes EBX (AEP ptr)
+        call    msc_mount               ; bring the disk up now (sets msc_mounted)
+        pop     ebx
+        mov     word ptr [ebx+2], 0     ; AEP_SUCCESS (stay resident either way)
         jmp     aer_out
 aer_inq:
-        mov     word ptr [ebx+2], 2     ; AEP_NO_MORE_DEVICES (claim none yet)
+        mov     esi, [ebx+12]           ; AEP_i_d_dcb
+        mov     [inq_dcb_ptr], esi
+        cmp     byte ptr [msc_mounted], 0
+        je      aer_inq_none            ; no disk -> no device
+        movzx   eax, byte ptr [esi + DCB_unit_on_ctl]
+        test    eax, eax
+        jnz     aer_inq_none            ; we only own unit 0
+        mov     word ptr [ebx+2], 0     ; AEP_SUCCESS: claim unit 0
+        jmp     aer_out
+aer_inq_none:
+        mov     word ptr [ebx+2], 2     ; AEP_NO_MORE_DEVICES
+        jmp     aer_out
+aer_cfg:
+        call    ios_config_dcb          ; fill geometry + insert request routine
+        mov     word ptr [ebx+2], 0     ; AEP_SUCCESS
         jmp     aer_out
 aer_ok:
         mov     word ptr [ebx+2], 0     ; AEP_SUCCESS
@@ -2021,6 +2330,220 @@ icd_fail:
         stc
         ret
 EndProc ios_create_ddb
+
+;----------------------------------------------------------------------------
+; ios_config_dcb: EBX = AEP_dcb_config.  Fill the DCB IOS handed us with our
+; disk geometry (from the ring-0 mount) and splice our request routine into
+; the DCB calldown stack so IOS routes read/write IORs to us.
+;----------------------------------------------------------------------------
+BeginProc ios_config_dcb
+        push    esi
+        push    edi
+        mov     esi, [ebx+12]           ; AEP_d_c_dcb = the DCB (offset 12)
+        mov     [cfg_dcb_ptr], esi
+        test    esi, esi
+        jz      icfg_done
+        cmp     esi, [cd_inserted_dcb]  ; re-broadcasts loop back to us -
+        je      icfg_done               ; never insert the calldown twice
+        ; Fill the ACTUAL transfer/geometry fields (top-level DCB, not the
+        ; apparent DCB_disk_geometry ones - those are the TSD's to compute).
+        ; With these zero the disk TSD sees a 0-length device and declines
+        ; the DCB, so no partition scan and no drive letter.
+        mov     dword ptr [esi + DCB_max_xfer_len], 10000h
+        mov     eax, [msc_blocks]
+        mov     [esi + DCB_actual_sector_cnt], eax
+        mov     dword ptr [esi + DCB_actual_sector_cnt + 4], 0
+        mov     eax, [msc_bsize]
+        mov     [esi + DCB_actual_blk_size], eax
+        mov     dword ptr [esi + DCB_actual_head_cnt], 255
+        mov     dword ptr [esi + DCB_actual_spt], 63
+        mov     eax, [msc_blocks]       ; cyls = blocks / (255*63)
+        xor     edx, edx
+        mov     ecx, 255*63
+        div     ecx
+        mov     [esi + DCB_actual_cyl_cnt], eax
+        or      dword ptr [esi+20h], 2  ; DCB_DEV_WRITEABLE (else VFAT
+                                        ; mounts the volume write-protected)
+        sub     esp, 24                 ; ISP_calldown_insert on the stack
+        mov     edi, esp
+        mov     word ptr [edi+0], 5     ; ISP_func = ISP_INSERT_CALLDOWN
+        mov     word ptr [edi+2], 0                     ; ISP_result
+        mov     [edi+4], esi                            ; ISP_i_cd_dcb
+        mov     dword ptr [edi+8], OFFSET32 CFU1_IosReq ; ISP_i_cd_req
+        mov     eax, [ebx+4]                            ; AEP_ddb
+        mov     [edi+12], eax                           ; ISP_i_cd_ddb
+        mov     word ptr [edi+16], 0                    ; ISP_i_cd_expan_len
+        mov     dword ptr [edi+18], 10h                 ; ISP_i_cd_flags = small_memory
+        mov     al, [ebx+8]                             ; AEP_lgn
+        mov     [edi+22], al                            ; ISP_i_cd_lgn
+        push    edi
+        call    dword ptr [cfu_ilb]     ; ILB_service_rtn
+        movzx   eax, word ptr [esp+4+2] ; ISP_result (ISP sits above pushed arg)
+        mov     [isp_cd_result], eax
+        add     esp, 24 + 4
+        test    eax, eax
+        jnz     icfg_done
+        mov     [cd_inserted_dcb], esi  ; insert succeeded - remember the DCB
+icfg_done:
+        pop     edi
+        pop     esi
+        ret
+EndProc ios_config_dcb
+
+;----------------------------------------------------------------------------
+; CFU1_IosReq: DCB calldown request routine.  Called by IOS as req(IOP*).
+; Services read/write/verify synchronously through the ring-0 BOT engine,
+; then unwinds one callback level to complete the IOP.
+;----------------------------------------------------------------------------
+BeginProc CFU1_IosReq
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+        mov     ebx, [ebp+8]            ; IOP pointer
+        movzx   eax, word ptr [ebx + IOP_ior + IOR_func]
+        inc     dword ptr [ior_total]
+        mov     [ior_last], eax
+        cmp     eax, 48
+        jae     @F
+        inc     dword ptr [ior_counts + eax*4]
+@@:
+        cmp     eax, 0                  ; IOR_READ
+        je      req_read
+        cmp     eax, 1                  ; IOR_WRITE
+        je      req_write
+        cmp     eax, 2                  ; IOR_VERIFY
+        je      req_ok                  ; nothing to verify -> succeed
+        cmp     eax, 5                  ; IOR_MEDIA_CHECK /
+        je      req_ok                  ; IOR_MEDIA_CHECK_RESET:
+        cmp     eax, 6                  ; media present, not changed
+        je      req_ok
+        mov     word ptr [ebx + IOP_ior + IOR_status], 16h  ; IORS_INVALID_COMMAND
+        jmp     req_done
+req_read:
+        cmp     byte ptr [msc_mounted], 0
+        je      req_ioerr
+        mov     byte ptr [xbusy], 1
+        mov     eax, [ebx + IOP_ior + IOR_start_addr]
+        test    dword ptr [ebx + IOP_ior + IOR_flags], 80000h
+        jz      @F                      ; IORF_LOGICAL_START_SECTOR:
+        add     eax, [part_start]       ; volume-relative -> physical LBA
+@@:     mov     ecx, [ebx + IOP_ior + IOR_xfer_count]   ; sector count
+        mov     edi, [ebx + IOP_ior + IOR_buffer_ptr]   ; dest buffer
+        push    ebx                     ; BOT engine trashes EBX (IOP ptr)
+        call    msc_do_read
+        pop     ebx
+        mov     byte ptr [xbusy], 0
+        jc      req_ioerr
+        jmp     req_ok
+req_write:
+        cmp     byte ptr [msc_mounted], 0
+        je      req_ioerr
+        mov     byte ptr [xbusy], 1
+        mov     eax, [ebx + IOP_ior + IOR_start_addr]
+        test    dword ptr [ebx + IOP_ior + IOR_flags], 80000h
+        jz      @F                      ; IORF_LOGICAL_START_SECTOR:
+        add     eax, [part_start]       ; volume-relative -> physical LBA
+@@:     mov     ecx, [ebx + IOP_ior + IOR_xfer_count]
+        mov     esi, [ebx + IOP_ior + IOR_buffer_ptr]
+        push    ebx                     ; BOT engine trashes EBX (IOP ptr)
+        call    msc_do_write
+        pop     ebx
+        mov     byte ptr [xbusy], 0
+        jc      req_ioerr
+req_ok:
+        mov     word ptr [ebx + IOP_ior + IOR_status], 0     ; IORS_SUCCESS
+        jmp     req_done
+req_ioerr:
+        mov     word ptr [ebx + IOP_ior + IOR_status], 15h   ; IORS_DEVICE_ERROR
+req_done:
+        mov     eax, [ebx + IOP_callback_ptr]
+        sub     eax, 8                  ; SIZE IOP_callback_entry
+        mov     [ebx + IOP_callback_ptr], eax
+        push    ebx                     ; IOP offset
+        call    dword ptr [eax]         ; IOP_CB_address
+        add     esp, 4
+        pop     edi
+        pop     esi
+        pop     ebx
+        pop     ebp
+        ret
+EndProc CFU1_IosReq
+
+;----------------------------------------------------------------------------
+; msc_do_read / msc_do_write: EAX=LBA, ECX=sector count, EDI(read)/ESI(write)=
+; linear buffer.  Build a SCSI READ(10)/WRITE(10) and run it via msc_bot.
+; CF set on transport or CSW failure.
+;----------------------------------------------------------------------------
+BeginProc msc_do_read
+        mov     [rw_lba], eax
+        mov     [rw_count], ecx
+        mov     [rw_buf], edi
+        mov     byte ptr [rw_wr], 0
+        call    msc_rw
+        ret
+EndProc msc_do_read
+
+BeginProc msc_do_write
+        mov     [rw_lba], eax
+        mov     [rw_count], ecx
+        mov     [rw_buf], esi
+        mov     byte ptr [rw_wr], 1
+        call    msc_rw
+        ret
+EndProc msc_do_write
+
+BeginProc msc_rw
+        push    edi                     ; zero the 16-byte CDB
+        cld
+        xor     eax, eax
+        mov     edi, OFFSET32 msc_cdb
+        mov     ecx, 4
+        rep     stosd
+        pop     edi
+        mov     al, 28h                 ; READ(10)
+        cmp     byte ptr [rw_wr], 0
+        je      @F
+        mov     al, 2Ah                 ; WRITE(10)
+@@:     mov     [msc_cdb+0], al
+        mov     eax, [rw_lba]           ; LBA big-endian into cdb[2..5]
+        mov     [msc_cdb+5], al
+        shr     eax, 8
+        mov     [msc_cdb+4], al
+        shr     eax, 8
+        mov     [msc_cdb+3], al
+        shr     eax, 8
+        mov     [msc_cdb+2], al
+        mov     eax, [rw_count]         ; block count big-endian into cdb[7..8]
+        mov     [msc_cdb+8], al
+        mov     [msc_cdb+7], ah
+        mov     eax, [rw_count]         ; datalen = count * bsize
+        mul     dword ptr [msc_bsize]
+        mov     [msc_datalen], eax
+        mov     byte ptr [msc_cdblen], 10
+        mov     al, 1                   ; dir: read = IN
+        cmp     byte ptr [rw_wr], 0
+        je      @F
+        xor     al, al                  ; write = OUT
+@@:     mov     [msc_dir], al
+        mov     eax, [rw_buf]
+        mov     [msc_databuf], eax
+        call    msc_bot
+        jc      rw_err
+        test    al, al                  ; CSW status
+        jnz     rw_err
+        clc
+        ret
+rw_err: stc
+        ret
+EndProc msc_rw
+
+rw_lba          dd      0
+rw_count        dd      0
+rw_buf          dd      0
+rw_wr           db      0
+                db      3 dup (0)
 
 ; msc_bulk_out: ESI = linear src, ECX = length.  CF set on failure.
 BeginProc msc_bulk_out

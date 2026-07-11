@@ -21,3 +21,7 @@ win/diag/CFUDISK.EXE
 win/diag/WREBOOT.EXE
 win/diag/CFUIOS.EXE
 win/diag/CFUMT.EXE
+win/diag/CFUDRV.EXE
+win/diag/CPEEK.EXE
+*.o
+win/vxd/CFU1.lst

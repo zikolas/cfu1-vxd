@@ -22,6 +22,7 @@
 #include "cfu1.h"
 
 static HANDLE hVxd = INVALID_HANDLE_VALUE;
+static int g_ring0 = 0;                 /* /R0: run BOT through the VxD */
 
 /* device/endpoint state discovered by enumeration */
 static unsigned char g_addr = 1;        /* address of the storage device   */
@@ -150,11 +151,39 @@ static void clear_halt(unsigned char ep)
 /*------------------------------------------------------------ BOT --------*/
 static unsigned long g_tag = 1;
 
+/* ring-0 BOT: hand the whole command to the VxD (CFU_MSCCMD).  Same
+ * contract as bot(): returns CSW status (0=good) or negative on failure. */
+static int bot_ring0(const unsigned char *cdb, int cdblen, int dir,
+                     void *data, int datalen)
+{
+    static unsigned char in[20 + 512];
+    static unsigned char out[4 + 512];
+    unsigned long csw;
+    memset(in, 0, sizeof in);
+    in[0] = (unsigned char)cdblen;
+    in[1] = (dir == 1) ? 1 : 0;
+    in[2] = (unsigned char)datalen;
+    in[3] = (unsigned char)(datalen >> 8);
+    memcpy(in + 4, cdb, cdblen);
+    if (dir == 0 && datalen) memcpy(in + 20, data, datalen);
+    memset(out, 0, sizeof out);
+    if (vxd_ioctl(CFU_MSCCMD, in, 20 + (dir == 0 ? datalen : 0),
+                  out, 4 + (dir == 1 ? datalen : 0)) != 0)
+        return -110;
+    csw = out[0] | (out[1]<<8) | ((unsigned long)out[2]<<16) | ((unsigned long)out[3]<<24);
+    if (csw == 0xFFFFFFFFUL) return -111;
+    if (dir == 1 && data && datalen) memcpy(data, out + 4, datalen);
+    return (int)csw;
+}
+
 /* run one SCSI command via Bulk-Only Transport.  dir: 1=IN 0=OUT -1=none.
  * returns CSW status (0=good), or negative on transport failure. */
 static int bot(const unsigned char *cdb, int cdblen, int dir,
                void *data, int datalen)
 {
+    if (g_ring0)
+        return bot_ring0(cdb, cdblen, dir, data, datalen);
+    {
     unsigned char cbw[31], csw[13];
     int got, st;
 
@@ -192,6 +221,7 @@ static int bot(const unsigned char *cdb, int cdblen, int dir,
     if (got < 13 || csw[0]!='U' || csw[1]!='S' || csw[2]!='B' || csw[3]!='S')
         return -102;
     return csw[12];                                         /* bCSWStatus */
+    }
 }
 
 /*---------------------------------------------------------- SCSI ---------*/
@@ -335,6 +365,12 @@ static int enumerate(void)
         return -1;
     }
     printf("bulk endpoints: IN 0x%02X, OUT 0x%02X\n", g_ep_in, g_ep_out);
+    if (g_ring0) {
+        unsigned char s[3];
+        s[0] = g_addr; s[1] = g_ep_in; s[2] = g_ep_out;
+        vxd_ioctl(CFU_MSCSET, s, 3, NULL, 0);   /* hand state to the VxD */
+        printf("(ring-0 BOT path: commands run inside the VxD)\n");
+    }
     return 0;
 }
 
@@ -472,6 +508,7 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (!stricmp(argv[i], "/SEC") && i + 1 < argc) want_sec = atoi(argv[++i]);
         else if (!stricmp(argv[i], "/DIR")) want_dir = 1;
+        else if (!stricmp(argv[i], "/R0")) g_ring0 = 1;
     }
 
     printf("CFUDISK - USB mass storage on the REX-CFU1\n");

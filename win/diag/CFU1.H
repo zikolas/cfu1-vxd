@@ -28,6 +28,9 @@
 #define CFU_FORCEKEY    0x1015  /* in: raw scan bytes -> VKD_Force_Keys     */
 #define CFU_KBDSTART    0x1016  /* in: BYTE ep, devaddr, mps, interval_ms   */
 #define CFU_KBDSTAT     0x1017  /* out: 6 DWORDs pipeline counters (debug)  */
+#define CFU_MSCSET      0x1018  /* in: BYTE addr, ep_in, ep_out             */
+#define CFU_MSCCMD      0x1019  /* in: cdblen,dir,datalen,cdb[16],out-data;
+                                   out: DWORD csw, in-data                  */
 
 #pragma pack(push, 1)
 typedef struct {

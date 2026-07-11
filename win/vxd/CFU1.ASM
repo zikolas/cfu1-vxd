@@ -55,8 +55,11 @@ CFU_AUTOSTAT    equ 1014h       ; out: DWORD (b0 run, b1 armed, b8-15 state)
 CFU_FORCEKEY    equ 1015h       ; in: raw scan bytes -> VKD_Force_Keys (test)
 CFU_KBDSTART    equ 1016h       ; in: BYTE ep,devaddr,mps,interval_ms
 CFU_KBDSTAT     equ 1017h       ; out: 6 DWORDs (pipeline counters, debug)
+CFU_MSCSET      equ 1018h       ; in: BYTE addr, ep_in, ep_out (reset toggles)
+CFU_MSCCMD      equ 1019h       ; in: BYTE cdblen,dir; WORD datalen; 16 cdb;
+                                ;     [OUT data]  out: DWORD csw; [IN data]
 
-VXD_VERSION     equ 00010604h   ; 1.64 - keyboard feed survives app exit
+VXD_VERSION     equ 00010701h   ; 1.71 - ring-0 mass storage (ESI-save fix)
 
 HIDRING_SLOTS   equ 32
 HIDSLOT_SIZE    equ 9
@@ -595,6 +598,10 @@ close_keep:
         je      ioc_kbdstart
         cmp     eax, CFU_KBDSTAT
         je      ioc_kbdstat
+        cmp     eax, CFU_MSCSET
+        je      ioc_mscset
+        cmp     eax, CFU_MSCCMD
+        je      ioc_msccmd
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -1460,6 +1467,96 @@ ioc_kbdstat:
 @@:     xor     eax, eax
         ret
 
+; CFU_MSCSET: set the mass-storage device address + bulk endpoints,
+; reset data toggles (call after the ring-3 tool does SET_CONFIGURATION)
+ioc_mscset:
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbInBuffer], 3
+        jb      ioc_badbuf
+        mov     al, [edx+0]
+        mov     [msc_addr], al
+        mov     al, [edx+1]
+        mov     [msc_epin], al
+        mov     al, [edx+2]
+        mov     [msc_epout], al
+        mov     byte ptr [msc_togin], 0
+        mov     byte ptr [msc_togout], 0
+        mov     dword ptr [msc_tag], 1
+        xor     eax, eax
+        ret
+
+; CFU_MSCCMD: run one BOT command.  in: [0]=cdblen [1]=dir [2:2]=datalen
+; [4:16]=cdb, then OUT data.  out: [0:4]=CSW status (FFFFFFFF=fail), IN data.
+ioc_msccmd:
+        cmp     [enabled], 0
+        je      ioc_notena
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbInBuffer], 20
+        jb      ioc_badbuf
+        mov     [xbusy], 1
+        mov     al, [edx+0]
+        mov     [msc_cdblen], al
+        mov     al, [edx+1]
+        mov     [msc_dir], al
+        movzx   eax, word ptr [edx+2]
+        mov     [msc_datalen], eax
+        push    esi
+        push    edi
+        cld
+        lea     esi, [edx+4]
+        mov     edi, OFFSET32 msc_cdb
+        mov     ecx, 16
+        rep     movsb
+        pop     edi
+        pop     esi
+        cmp     byte ptr [msc_dir], 0
+        jne     mcc_in
+        mov     edx, [esi.lpvInBuffer]  ; OUT data follows the 20-byte header
+        add     edx, 20
+        mov     [msc_databuf], edx
+        jmp     mcc_go
+mcc_in:
+        mov     edx, [esi.lpvOutBuffer] ; IN data lands after the 4-byte CSW
+        test    edx, edx
+        jz      mcc_bad
+        add     edx, 4
+        mov     [msc_databuf], edx
+mcc_go:
+        push    esi                     ; msc_bot trashes ESI (DIOCParams ptr)
+        call    msc_bot
+        mov     [xbusy], 0
+        pop     esi
+        jc      mcc_failw
+        movzx   eax, al                 ; CSW status
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      mcc_len
+        mov     [edx], eax
+        jmp     mcc_len
+mcc_failw:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      mcc_len
+        mov     dword ptr [edx], 0FFFFFFFFh
+mcc_len:
+        mov     ecx, [esi.lpcbBytesReturned]
+        test    ecx, ecx
+        jz      mcc_done
+        mov     eax, [msc_datalen]
+        add     eax, 4
+        mov     [ecx], eax
+mcc_done:
+        xor     eax, eax
+        ret
+mcc_bad:
+        mov     [xbusy], 0
+        mov     eax, CFUERR_BUFFER
+        ret
+
 ioc_notena:
         mov     eax, CFUERR_NOTENAB
         ret
@@ -1729,6 +1826,192 @@ dc_fail:
         stc
         ret
 EndProc do_control
+
+;----------------------------------------------------------------------------
+; ring-0 mass storage: Bulk-Only Transport + SCSI (Stage 1 of drive-letter).
+; msc_bot runs one BOT command using the msc_* globals; the caller fills in
+; msc_cdb/cdblen/dir/datalen/databuf and sets msc_addr/epin/epout first.
+;----------------------------------------------------------------------------
+VxD_LOCKED_DATA_SEG
+msc_addr        db      1
+msc_epin        db      81h
+msc_epout       db      2
+msc_togin       db      0
+msc_togout      db      0
+msc_cdblen      db      0
+msc_dir         db      0               ; 1 = data IN, 0 = OUT/none
+                db      1 dup (0)
+msc_tag         dd      1
+msc_datalen     dd      0
+msc_databuf     dd      0               ; linear address of data buffer
+msc_cdb         db      16 dup (0)
+msc_cbw         db      31 dup (0)
+msc_csw         db      16 dup (0)
+VxD_LOCKED_DATA_ENDS
+
+; msc_bulk_out: ESI = linear src, ECX = length.  CF set on failure.
+BeginProc msc_bulk_out
+        cld
+        mov     [xr_tries], 500
+mbo_l:
+        test    ecx, ecx
+        jz      mbo_ok
+        mov     ebx, ecx
+        cmp     ebx, 64
+        jbe     @F
+        mov     ebx, 64
+@@:     push    ecx
+        push    esi
+        mov     ecx, ebx
+        mov     al, 10h
+        call    buf_to_chip
+        pop     esi
+        pop     ecx
+        mov     al, [msc_epout]
+        and     al, 0Fh
+        or      al, 10h                 ; OUT PID
+        mov     [xa_pidep], al
+        mov     al, [msc_addr]
+        mov     [xa_addr], al
+        mov     al, bl
+        mov     [xa_len], al
+        mov     al, 07h                 ; ARM|ENABLE|OUT
+        test    byte ptr [msc_togout], 1
+        jz      @F
+        or      al, 40h
+@@:     mov     [xa_ctl], al
+        call    do_xact_retry
+        jc      mbo_err
+        test    al, 01h
+        jz      mbo_err
+        xor     byte ptr [msc_togout], 1
+        add     esi, ebx
+        sub     ecx, ebx
+        jmp     mbo_l
+mbo_ok: clc
+        ret
+mbo_err:
+        stc
+        ret
+EndProc msc_bulk_out
+
+; msc_bulk_in: EDI = linear dst, ECX = length.  Stops on a short packet.
+; CF set on failure.
+BeginProc msc_bulk_in
+        cld
+        mov     [xr_tries], 500
+mbi_l:
+        test    ecx, ecx
+        jz      mbi_ok
+        mov     ebx, ecx
+        cmp     ebx, 64
+        jbe     @F
+        mov     ebx, 64
+@@:     mov     al, [msc_epin]
+        and     al, 0Fh
+        or      al, 90h                 ; IN PID
+        mov     [xa_pidep], al
+        mov     al, [msc_addr]
+        mov     [xa_addr], al
+        mov     al, bl
+        mov     [xa_len], al
+        mov     al, 03h                 ; ARM|ENABLE
+        test    byte ptr [msc_togin], 1
+        jz      @F
+        or      al, 40h
+@@:     mov     [xa_ctl], al
+        call    do_xact_retry
+        jc      mbi_err
+        test    al, 01h
+        jz      mbi_err
+        xor     byte ptr [msc_togin], 1
+        mov     al, 04h                 ; SL811 remaining-count register
+        call    sl_rd
+        mov     ah, bl                  ; AH = requested chunk
+        sub     ah, al                  ; AH = got = requested - remaining
+        movzx   edx, ah
+        push    ecx
+        mov     ecx, edx
+        mov     al, 10h
+        call    buf_from_chip           ; EDI += got
+        pop     ecx
+        sub     ecx, edx                ; remaining -= got
+        cmp     edx, 64
+        jb      mbi_ok                  ; short packet ends the transfer
+        jmp     mbi_l
+mbi_ok: clc
+        ret
+mbi_err:
+        stc
+        ret
+EndProc msc_bulk_in
+
+; msc_bot: one Bulk-Only Transport command.  AL = CSW status (0 = good) on
+; success; CF set on transport failure.
+BeginProc msc_bot
+        cld
+        mov     byte ptr [msc_cbw+0], 'U'
+        mov     byte ptr [msc_cbw+1], 'S'
+        mov     byte ptr [msc_cbw+2], 'B'
+        mov     byte ptr [msc_cbw+3], 'C'
+        mov     eax, [msc_tag]
+        mov     dword ptr [msc_cbw+4], eax
+        inc     dword ptr [msc_tag]
+        mov     eax, [msc_datalen]
+        mov     dword ptr [msc_cbw+8], eax
+        mov     al, [msc_dir]
+        test    al, al
+        jz      @F
+        mov     al, 80h
+@@:     mov     [msc_cbw+12], al
+        mov     byte ptr [msc_cbw+13], 0
+        mov     al, [msc_cdblen]
+        mov     [msc_cbw+14], al
+        push    esi
+        push    edi
+        mov     esi, OFFSET32 msc_cdb
+        mov     edi, OFFSET32 msc_cbw
+        add     edi, 15
+        mov     ecx, 16
+        rep     movsb
+        pop     edi
+        pop     esi
+
+        mov     esi, OFFSET32 msc_cbw   ; CBW out
+        mov     ecx, 31
+        call    msc_bulk_out
+        jc      mbt_fail
+
+        mov     ecx, [msc_datalen]      ; data phase
+        test    ecx, ecx
+        jz      mbt_csw
+        cmp     byte ptr [msc_dir], 0
+        je      mbt_dout
+        mov     edi, [msc_databuf]
+        mov     ecx, [msc_datalen]
+        call    msc_bulk_in
+        jmp     mbt_csw
+mbt_dout:
+        mov     esi, [msc_databuf]
+        mov     ecx, [msc_datalen]
+        call    msc_bulk_out
+
+mbt_csw:
+        mov     edi, OFFSET32 msc_csw   ; CSW in
+        mov     ecx, 13
+        call    msc_bulk_in
+        jc      mbt_fail
+        cmp     byte ptr [msc_csw+0], 'U'
+        jne     mbt_fail
+        cmp     byte ptr [msc_csw+3], 'S'
+        jne     mbt_fail
+        mov     al, [msc_csw+12]
+        clc
+        ret
+mbt_fail:
+        stc
+        ret
+EndProc msc_bot
 
 ;----------------------------------------------------------------------------
 ; setup_pkt: fill ct_setup with AL=bmRequestType AH=bRequest BX=wValue

@@ -41,6 +41,11 @@
 #define CFU_IOSCFG      0x1020  /* broadcast AEP_CONFIG_DCB; out: results   */
 #define CFU_IOSVOL      0x1021  /* create logical vol DCB + associate;
                                    out: DWORD (create<<16)|assoc            */
+#define CFU_VOLUP       0x1022  /* mount + volume up; out: (mnt<<16)|hasvol */
+#define CFU_VOLDOWN     0x1023  /* polite teardown; in: BYTE force;
+                                   out: 0 ok, 1 vetoed, 2 no volume         */
+#define CFU_VOLSTAT     0x1024  /* out: mounted, log_dcb, part_start,
+                                   part_len, drive_index (5 DWORDs)         */
 
 #pragma pack(push, 1)
 typedef struct {

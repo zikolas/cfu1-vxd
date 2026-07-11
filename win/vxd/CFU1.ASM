@@ -67,7 +67,7 @@ CFU_IOSSTAT     equ 101Bh       ; out: total, lastfunc, regresult, counts[16]
 CFU_MSCMOUNT    equ 101Ch       ; ring-0 enumerate + READ CAPACITY;
                                 ; out: DWORD blocks, DWORD block_size
 
-VXD_VERSION     equ 00010802h   ; 1.82 - ring-0 mass-storage mount
+VXD_VERSION     equ 00010803h   ; 1.83 - mount ESI-save fix
 
 HIDRING_SLOTS   equ 32
 HIDSLOT_SIZE    equ 9
@@ -1618,7 +1618,9 @@ ioc_mscmount:
         cmp     [enabled], 0
         je      ioc_notena
         mov     [xbusy], 1
+        push    esi                     ; msc_mount trashes ESI (DIOCParams)
         call    msc_mount
+        pop     esi
         mov     [xbusy], 0
         mov     edx, [esi.lpvOutBuffer]
         test    edx, edx

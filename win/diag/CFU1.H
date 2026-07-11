@@ -16,6 +16,7 @@
 #define CFU_IRQUNHOOK   0x1009
 #define CFU_PCICRD      0x100A  /* in: BYTE reg (socket-relative) out: DWORD*/
 #define CFU_PCICWR      0x100B  /* in: BYTE reg, BYTE val                   */
+#define CFU_GETCONF     0x100C  /* out: CFU_CONF                            */
 
 #pragma pack(push, 1)
 typedef struct {
@@ -33,6 +34,17 @@ typedef struct {
     unsigned char   pcicstat;   /* PCIC interface status register           */
     unsigned char   rsvd;
 } CFU_RESULT;
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+typedef struct {
+    unsigned short  iobase;     /* Windows-assigned I/O base (0 = none)     */
+    unsigned char   irq;        /* Windows-assigned IRQ (0xFF = none)       */
+    unsigned char   socket;     /* socket found by cor_fix (0xFF = none)    */
+    unsigned char   flags;      /* bit0 devnode bit1 started bit2 COR-fixed */
+    unsigned char   corrb;      /* COR readback at CONFIG_START             */
+    unsigned short  rsvd;
+} CFU_CONF;
 #pragma pack(pop)
 
 #define CFUERR_NOCARD   1

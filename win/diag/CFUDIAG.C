@@ -463,6 +463,42 @@ static void list_live_devnodes(void)
     RegCloseKey(hk);
 }
 
+/* show what the PnP path (CONFIGMG -> CFU1.VXD config handler) captured;
+ * returns nonzero if the card is already enabled by PnP (skip re-enable) */
+static int show_conf(void)
+{
+    CFU_CONF c;
+    memset(&c, 0xEE, sizeof c);
+    if (vxd_ioctl(CFU_GETCONF, NULL, 0, &c, sizeof c) != 0) {
+        printf("GETCONF failed (old VxD loaded? GetLastError %lu)\n",
+               GetLastError());
+        return 0;
+    }
+    printf("PnP state: devnode %s, started %s, COR fix %s\n",
+           (c.flags & 1) ? "SEEN" : "never seen",
+           (c.flags & 2) ? "YES" : "no",
+           (c.flags & 4) ? "APPLIED" : "no");
+    printf("  Windows-assigned I/O base: %03X   IRQ: %u   socket: %u   COR rb: %02X\n",
+           c.iobase, c.irq, c.socket, c.corrb);
+    if ((c.flags & 4) && c.iobase) {
+        iobase = c.iobase;
+        return 1;
+    }
+    return 0;
+}
+
+/* delete the card's registry enum branch so the next insertion enumerates
+ * fresh and picks up a newly-installed INF (Win9x RegDeleteKey is
+ * recursive) */
+static void clean_id(void)
+{
+    LONG rc = RegDeleteKey(HKEY_LOCAL_MACHINE,
+                    "Enum\\PCMCIA\\RATOC-USB_HOST_CF+_CARD-57DD");
+    printf("delete HKLM\\Enum\\PCMCIA\\RATOC-USB_HOST_CF+_CARD-57DD: %s (%ld)\n",
+           rc == ERROR_SUCCESS ? "OK" : "failed", rc);
+    printf("eject and reinsert the card to re-enumerate.\n");
+}
+
 static void pcic_dump(void)
 {
     int r;
@@ -532,7 +568,7 @@ static HANDLE load_vxd(void)
 
 int main(int argc, char **argv)
 {
-    int i, dosof = 0, swap = 0, dodet = 0, dooff = 0, irq = -1, dodump = 0, doenum = 0;
+    int i, dosof = 0, swap = 0, dodet = 0, dooff = 0, irq = -1, dodump = 0, doenum = 0, doconf = 0, pnp_up = 0, rdreg_arg = -1, wrreg_arg = -1, wrval_arg = 0;
     DWORD ver = 0;
 
     for (i = 1; i < argc; i++) {
@@ -545,6 +581,10 @@ int main(int argc, char **argv)
         else if (!stricmp(argv[i], "/LIVE")) { list_live_devnodes(); return 0; }
         else if (!stricmp(argv[i], "/PCIC")) dodump = 1;
         else if (!stricmp(argv[i], "/ENUM")) doenum = 1;
+        else if (!stricmp(argv[i], "/CONF")) doconf = 1;
+        else if (!stricmp(argv[i], "/RD") && i + 1 < argc) { rdreg_arg = (int)strtoul(argv[++i], NULL, 16); }
+        else if (!stricmp(argv[i], "/WR") && i + 2 < argc) { wrreg_arg = (int)strtoul(argv[++i], NULL, 16); wrval_arg = (int)strtoul(argv[++i], NULL, 16); }
+        else if (!stricmp(argv[i], "/CLEANID")) { clean_id(); return 0; }
         else if (!stricmp(argv[i], "/IRQ") && i + 1 < argc) irq = atoi(argv[++i]);
         else if (!stricmp(argv[i], "/SOCKET") && i + 1 < argc) socketno = atoi(argv[++i]);
         else if (!stricmp(argv[i], "/BASE") && i + 1 < argc) iobase = strtoul(argv[++i], NULL, 16);
@@ -575,13 +615,39 @@ int main(int argc, char **argv)
     if (raw)
         SetUnhandledExceptionFilter(fault_filter);
 
+    if (doconf && !raw) {
+        pnp_up = show_conf();
+        /* /CONF alone inspects PnP state without touching the hardware */
+        if (!(dosof || swap || dodet || doenum || dodump || dooff || irq >= 0)) {
+            CloseHandle(hVxd);
+            return 0;
+        }
+    }
+
     if (dooff) {
         if (raw && (pr(0x01) & 0x0C) != 0x0C) printf("(no card)\n");
         power_off();
         return 0;
     }
 
-    if (raw ? !enable_raw() : !enable_vxd()) return 1;
+    if (pnp_up)
+        printf("using PnP-enabled card at 0x%03X (no re-enable)\n", iobase);
+    else if (raw ? !enable_raw() : !enable_vxd()) return 1;
+
+    /* quick register peek/poke path: /WR reg val and/or /RD reg, then out */
+    if ((wrreg_arg >= 0 || rdreg_arg >= 0) &&
+        !(dosof || swap || dodet || doenum || dodump || irq >= 0)) {
+        if (wrreg_arg >= 0) {
+            slw((unsigned char)wrreg_arg, (unsigned char)wrval_arg);
+            printf("wr [%02X] = %02X\n", wrreg_arg, wrval_arg);
+        }
+        if (rdreg_arg >= 0)
+            printf("rd [%02X] = %02X (again: %02X)\n", rdreg_arg,
+                   slr((unsigned char)rdreg_arg), slr((unsigned char)rdreg_arg));
+        if (hVxd != INVALID_HANDLE_VALUE) CloseHandle(hVxd);
+        return 0;
+    }
+
     identify();
     regdump();
     ramtest();
@@ -591,6 +657,13 @@ int main(int argc, char **argv)
     if (doenum) { usb_enum(); slw(SL_INTENA, 0); slw(SL_INTSTAT, 0xFF); }
     if (dosof || swap) { start_sof(swap); linestate("sof"); }
     if (irq >= 0) { if (!(dosof || swap)) start_sof(swap); irqtest(irq); }
+    if (wrreg_arg >= 0) {
+        slw((unsigned char)wrreg_arg, (unsigned char)wrval_arg);
+        printf("wr [%02X] = %02X\n", wrreg_arg, wrval_arg);
+    }
+    if (rdreg_arg >= 0)
+        printf("rd [%02X] = %02X (again: %02X)\n", rdreg_arg,
+               slr((unsigned char)rdreg_arg), slr((unsigned char)rdreg_arg));
     if (dosof || swap || irq >= 0) {
         /* leaving INTENA set with no handler wedges IREQ# and makes the
          * OS PCMCIA layer shut the socket down - quiesce before exit */

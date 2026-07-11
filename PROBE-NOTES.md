@@ -192,3 +192,47 @@ Next milestones: (1) INF + CONFIGMG-integrated VxD → Windows-assigned IRQ +
 auto-enable on insertion; (2) transfer engine (control/interrupt/bulk) in
 the VxD proper; (3) HID interrupt polling demo (mouse moves a Win98 cursor
 via our card?); (4) mass storage → drive letter.
+
+## PNP / CONFIGMG MILESTONE — 2026-07-11 late (ThinkPad 235)
+
+**Full PnP chain works**: INF (DevLoader=CFU1.vxd) + VxD 1.10 with
+PNP_NEW_DEVNODE -> CM_Register_Device_Driver -> CONFIG_START ->
+CM_Get_Alloc_Log_Conf. On insertion Windows installed the INF (user had
+to point the wizard at C:\WINDOWS\INF once), created devnode
+PCMCIA\RATOC-USB_HOST_CF+_CARD-57DD\0 (no problem flags), assigned
+**I/O 0x280 (CFTABLE entry 3!) + IRQ 15**, PCCARD programmed the socket
+(power 0xF5, steering 0x6F), and our config handler's cor_fix found the
+socket by matching the enabled I/O window, applied COR@0xFC (readback
+0x42), all automatically. /ENUM then read the device descriptor at the
+Windows-assigned base. CFUDIAG /CONF shows the PnP state and skips
+re-enable when the PnP path already enabled the card.
+
+New findings:
+* **Deviceless SOF does not start on the 235** (any init path, any COR
+  value, latch written or not, native-speed or ioctl timing): frame timer
+  frozen, kickstart ARM never clears. With a device attached SOF runs
+  immediately. The PC110 runs SOF deviceless fine -- host-environment
+  interaction (socket power margins? osc start-up?), not chip logic.
+  Irrelevant operationally (host mode always has a device) but diag
+  expectations must account for it.
+* **IRQ 15 assigned by Windows still delivers nothing** (IREQ# asserted
+  at PCIC, steering correct). Hypothesis: the 235 only wires a subset of
+  PCIC IRQ pins (only IRQ7 is DOS-proven, owned by LPT under Windows);
+  CONFIGMG assigned 15 = the disabled secondary IDE's line, likely
+  unwired from the PCIC. Test plan: INF LogConfig override (documented
+  MS mechanism "INF Override for Configuring PC Card Interrupts") to
+  constrain the IRQ list + free IRQ7 by disabling LPT in Device Manager.
+  Until then: POLLED operation, which the whole transfer path uses anyway.
+* Card I/O ports are NOT virtualized for V86/DOS boxes (unlike the PCIC
+  index/data ports and low linear memory) -- direct port pokes at the
+  card's I/O base from a Win98 DOS box reach real hardware. CFUSOF.C
+  (dos/) exploits this for native-timing SOF tests inside Windows.
+* VxD 1.10 adds: PNP_NEW_DEVNODE + config handler + cor_fix (socket scan
+  by I/O window match, PCIC reg save/restore around the attr poke),
+  CFU_GETCONF ioctl. CFUDIAG adds /CONF /CLEANID /RD /WR.
+* Deploy layout: CFU1.VXD in C:\WINDOWS\SYSTEM, CFU1.INF in
+  C:\WINDOWS\INF, diag kit in C:\CFU1.
+
+Next: transfer engine inside the VxD (single-ioctl transactions; polled
+first, IRQ when the routing puzzle is solved) -> SET_ADDRESS + full
+enumeration -> HID interrupt-IN polling demo -> mass storage.

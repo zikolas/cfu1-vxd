@@ -23,6 +23,7 @@
         include vmm.inc
         include vwin32.inc
         include vpicd.inc
+        include configmg.inc
 
 ;----------------------------------------------------------------------------
 ; ioctl codes (keep in sync with win/diag/CFU1.H)
@@ -39,8 +40,19 @@ CFU_IRQCOUNT    equ 1008h       ; out: DWORD count (does not clear)
 CFU_IRQUNHOOK   equ 1009h
 CFU_PCICRD      equ 100Ah       ; in: BYTE reg (socket bank added) out: DWORD
 CFU_PCICWR      equ 100Bh       ; in: BYTE reg, BYTE val
+CFU_GETCONF     equ 100Ch       ; out: CFU_CONF (PnP-assigned resources)
 
-VXD_VERSION     equ 00010001h   ; 1.01
+VXD_VERSION     equ 00010100h   ; 1.10 - PnP/CONFIGMG integration
+
+; CFU_CONF output structure offsets
+CC_IOBASE       equ 0           ; WORD  Windows-assigned I/O base (0 = none)
+CC_IRQ          equ 2           ; BYTE  Windows-assigned IRQ (FF = none)
+CC_SOCKET       equ 3           ; BYTE  socket the card was found in (FF=?)
+CC_FLAGS        equ 4           ; BYTE  bit0 devnode seen, bit1 started,
+                                ;       bit2 COR fix applied
+CC_CORRB        equ 5           ; BYTE  COR readback at CONFIG_START
+CC_RSVD         equ 6           ; WORD
+CFU_CONF_SIZE   equ 8
 
 ; CFU_SETUP input structure offsets
 CS_IOBASE       equ 0           ; WORD  I/O base (0 = default 0x260)
@@ -81,6 +93,17 @@ attrlin         dd      0               ; mapped linear addr of attr window
 irqhandle       dd      0
 irqcount        dd      0
 vid             VPICD_IRQ_Descriptor    <>
+
+; PnP state (filled by the CONFIGMG path)
+pnp_devnode     dd      0
+pnp_iobase      dw      0
+pnp_irq         db      0FFh
+pnp_socket      db      0FFh
+pnp_flags       db      0               ; bit0 devnode, bit1 started, bit2 COR
+pnp_corrb       db      0
+                dw      0
+savregs         db      8 dup (0)       ; cor_fix PCIC reg save area
+cmconfig        Config_Buff_s <>
 VxD_LOCKED_DATA_ENDS
 
 VxD_LOCKED_CODE_SEG
@@ -127,9 +150,228 @@ BeginProc CFU1_Control
         Control_Dispatch SYS_DYNAMIC_DEVICE_INIT, CFU1_Init
         Control_Dispatch SYS_DYNAMIC_DEVICE_EXIT, CFU1_Exit
         Control_Dispatch W32_DEVICEIOCONTROL,     CFU1_Ioctl
+        Control_Dispatch PNP_NEW_DEVNODE,         CFU1_NewDevnode
         clc
         ret
 EndProc CFU1_Control
+
+;----------------------------------------------------------------------------
+; PNP_NEW_DEVNODE: EBX = devnode, EDX = load type.  Register our config
+; handler so CONFIGMG tells us when the card's resources are assigned.
+;----------------------------------------------------------------------------
+BeginProc CFU1_NewDevnode
+        cmp     edx, DLVXD_LOAD_DEVLOADER
+        je      @F
+        cmp     edx, DLVXD_LOAD_DRIVER
+        jne     nd_ok                   ; not for us; report success anyway
+@@:
+        mov     [pnp_devnode], ebx
+        or      [pnp_flags], 1
+        VxDCall _CONFIGMG_Register_Device_Driver, <ebx, <OFFSET32 CFU1_ConfigHandler>, 0, <CM_REGISTER_DEVICE_DRIVER_DISABLEABLE OR CM_REGISTER_DEVICE_DRIVER_REMOVABLE>>
+        ; EAX = CR_* result; pass it back
+        clc
+        ret
+nd_ok:
+        mov     eax, CR_SUCCESS
+        clc
+        ret
+EndProc CFU1_NewDevnode
+
+;----------------------------------------------------------------------------
+; CONFIGMG config handler (C convention):
+;   CONFIGRET handler(func, subfunc, devnode, refdata, flags)
+;   [ebp+8]=func [ebp+12]=subfunc [ebp+16]=devnode [ebp+20]=ref [ebp+24]=flags
+;----------------------------------------------------------------------------
+BeginProc CFU1_ConfigHandler
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        push    esi
+        push    edi
+
+        mov     eax, [ebp+8]
+        cmp     eax, CONFIG_START
+        je      ch_start
+        cmp     eax, CONFIG_STOP
+        je      ch_stop
+        cmp     eax, CONFIG_REMOVE
+        je      ch_stop
+        mov     eax, CR_DEFAULT
+        jmp     ch_done
+
+ch_start:
+        ; fetch the resources Windows assigned to the card
+        mov     ebx, [ebp+16]           ; devnode
+        VxDCall _CONFIGMG_Get_Alloc_Log_Conf, <<OFFSET32 cmconfig>, ebx, CM_GET_ALLOC_LOG_CONF_ALLOC>
+        test    eax, eax                ; CR_SUCCESS = 0
+        jnz     ch_start_noconf
+        cmp     [cmconfig.wNumIOPorts], 0
+        je      @F
+        mov     ax, word ptr [cmconfig.wIOPortBase]
+        mov     [pnp_iobase], ax
+        mov     [iobase], ax            ; adopt as the active I/O base
+@@:     cmp     [cmconfig.wNumIRQs], 0
+        je      @F
+        mov     al, byte ptr [cmconfig.bIRQRegisters]
+        mov     [pnp_irq], al
+@@:
+ch_start_noconf:
+        or      [pnp_flags], 2          ; started
+        call    cor_fix                 ; the reason this driver exists
+        mov     eax, CR_SUCCESS
+        jmp     ch_done
+
+ch_stop:
+        and     [pnp_flags], NOT 2
+        mov     eax, CR_SUCCESS
+
+ch_done:
+        pop     edi
+        pop     esi
+        pop     ebx
+        pop     ebp
+        ret
+EndProc CFU1_ConfigHandler
+
+;----------------------------------------------------------------------------
+; cor_fix: find which socket carries an enabled I/O window covering our
+; assigned iobase, then briefly borrow memory window 0 on that socket to
+; write the REAL configuration register at attribute 0xFC (the CIS lies
+; and says 0xF8, so the OS-written COR never landed).  PCIC window regs
+; are saved and restored around the poke.
+;----------------------------------------------------------------------------
+BeginProc cor_fix
+        push    ebx
+        push    ecx
+        push    edx
+        push    esi
+
+        ; --- find the socket: banks 0..3 ---
+        xor     ecx, ecx
+cf_scan:
+        mov     al, cl
+        shl     al, 6
+        mov     [sockoff], al
+        mov     ah, 01h
+        call    pcic_rd
+        and     al, 0Ch
+        cmp     al, 0Ch                 ; card present?
+        jne     cf_next
+        mov     ah, 06h
+        call    pcic_rd
+        test    al, 40h                 ; I/O window 0 enabled?
+        jz      cf_next
+        mov     ah, 08h
+        call    pcic_rd
+        mov     bl, al
+        mov     ah, 09h
+        call    pcic_rd
+        mov     bh, al                  ; BX = window start
+        mov     dx, [pnp_iobase]
+        test    dx, dx
+        jnz     @F
+        mov     dx, [iobase]
+@@:     cmp     bx, dx
+        jne     cf_next
+        jmp     cf_found
+cf_next:
+        inc     ecx
+        cmp     ecx, 4
+        jb      cf_scan
+        jmp     cf_out                  ; no socket found; leave flags unset
+
+cf_found:
+        mov     al, cl
+        mov     [pnp_socket], al
+
+        ; --- save PCIC regs 06,10-15 into savregs ---
+        mov     ah, 06h
+        call    pcic_rd
+        mov     [savregs+0], al
+        mov     ah, 10h
+cf_save:
+        call    pcic_rd
+        movzx   ebx, ah
+        mov     [savregs+ebx-0Fh], al   ; 10h -> +1 ... 15h -> +6
+        inc     ah
+        cmp     ah, 16h
+        jb      cf_save
+
+        ; --- map attribute window at attrseg, poke COR, restore ---
+        movzx   ebx, [attrseg]
+        shr     ebx, 8
+        mov     ah, 10h
+        mov     al, bl
+        call    pcic_wr
+        mov     ah, 11h
+        mov     al, bh
+        and     al, 3Fh
+        call    pcic_wr
+        lea     ecx, [ebx+3]
+        mov     ah, 12h
+        mov     al, cl
+        call    pcic_wr
+        mov     ah, 13h
+        mov     al, ch
+        and     al, 3Fh
+        call    pcic_wr
+        mov     eax, 0
+        sub     eax, ebx
+        and     eax, 3FFFh
+        or      eax, 4000h
+        push    eax
+        mov     ah, 14h
+        call    pcic_wr
+        pop     eax
+        mov     al, ah
+        mov     ah, 15h
+        call    pcic_wr
+        mov     ah, 06h
+        call    pcic_rd
+        or      al, 01h
+        mov     ah, 06h
+        call    pcic_wr
+        mov     ecx, 2000
+        call    iodelay
+
+        movzx   eax, [attrseg]
+        shl     eax, 4
+        VMMCall _MapPhysToLinear, <eax, 1000h, 0>
+        cmp     eax, 0FFFFFFFFh
+        je      cf_restore
+        mov     [attrlin], eax
+        mov     edx, eax
+        mov     byte ptr [edx+1F8h], 42h    ; REAL COR: attr 0xFC
+        mov     ecx, 2000
+        call    iodelay
+        mov     al, [edx+1F8h]
+        mov     [pnp_corrb], al
+        cmp     al, 42h
+        jne     cf_restore
+        or      [pnp_flags], 4          ; COR fix confirmed
+        mov     [enabled], 1
+
+cf_restore:
+        ; --- restore PCIC regs 10-15 then 06 ---
+        mov     ah, 10h
+cf_rest:
+        movzx   ebx, ah
+        mov     al, [savregs+ebx-0Fh]
+        call    pcic_wr
+        inc     ah
+        cmp     ah, 16h
+        jb      cf_rest
+        mov     ah, 06h
+        mov     al, [savregs+0]
+        call    pcic_wr
+
+cf_out:
+        pop     esi
+        pop     edx
+        pop     ecx
+        pop     ebx
+        ret
+EndProc cor_fix
 
 BeginProc CFU1_Init
         clc
@@ -185,6 +427,8 @@ BeginProc CFU1_Ioctl
         je      ioc_pcicrd
         cmp     eax, CFU_PCICWR
         je      ioc_pcicwr
+        cmp     eax, CFU_GETCONF
+        je      ioc_getconf
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -479,6 +723,30 @@ ioc_wrattr:
         mov     edx, [attrlin]
         mov     [edx+eax], cl
         xor     eax, eax
+        ret
+
+ioc_getconf:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], CFU_CONF_SIZE
+        jb      ioc_badbuf
+        mov     ax, [pnp_iobase]
+        mov     [edx+CC_IOBASE], ax
+        mov     al, [pnp_irq]
+        mov     [edx+CC_IRQ], al
+        mov     al, [pnp_socket]
+        mov     [edx+CC_SOCKET], al
+        mov     al, [pnp_flags]
+        mov     [edx+CC_FLAGS], al
+        mov     al, [pnp_corrb]
+        mov     [edx+CC_CORRB], al
+        mov     word ptr [edx+CC_RSVD], 0
+        mov     edx, [esi.lpcbBytesReturned]
+        test    edx, edx
+        jz      @F
+        mov     dword ptr [edx], CFU_CONF_SIZE
+@@:     xor     eax, eax
         ret
 
 ioc_pcicrd:

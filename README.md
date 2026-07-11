@@ -1,0 +1,113 @@
+# cfu1-win9x
+
+Windows 95/98 driver (and DOS tooling) for the **RATOC REX-CFU1 "USB HOST
+CF+ Card"** — a CompactFlash-sized USB 1.1 host controller card built
+around the Cypress/ScanLogic **SL811HS**. RATOC only ever shipped Windows
+CE drivers for it; this project makes the card work on PCs.
+
+Current state: the card enables, identifies, and **performs USB
+transactions on Windows 98 through the included VxD** (device descriptor
+read from an attached device, polled transfers). A proper PnP driver with
+Windows-assigned IRQ, an in-VxD transfer engine, and class support (HID,
+mass storage) are the roadmap.
+
+## Why no driver ever existed: the card's CIS lies
+
+The card's CIS CONFIG tuple declares its configuration register at
+attribute address **0xF8**. The real (and only) configuration register is
+at attribute **0xFC** — writes to 0xF8 never latch. Any
+standards-following host stack (Windows 9x PCCARD, Card Services, etc.)
+writes the COR at the address the CIS declares, the card ignores it, and
+the card stays dead. Every tool and driver here maps an attribute-memory
+window and pokes 0xFC directly.
+
+More hardware findings (verified on real hardware — an IBM PC110 under DOS
+and a ThinkPad 235 under Windows 98) are documented in
+[PROBE-NOTES.md](PROBE-NOTES.md), including:
+
+* full CIS dump and decode; MANFID C015/0001; PnP ID
+  `PCMCIA\RATOC-USB_HOST_CF+_CARD-57DD`
+* address decode map (A0 = SL811 addr/data select, A1 = an unidentified
+  latch, A2/A5–A7 ignored)
+* SL811HS gotchas: the SOF timer is gated by INTENA bit 4; SOF generation
+  needs the EP-A kickstart; the AFTERSOF host-control bit hangs non-
+  full-speed transfers; the D+ speed-detect status bit is unreliable
+  (probe full-speed first, fall back to low-speed + DSWAP)
+* Windows 98 gotchas: VxDs must be linked dynamically loadable; ring-3
+  hardware access is silently virtualized; the OS PCMCIA layer races
+  socket enables and shuts down sockets with unserviced interrupts
+
+## Contents
+
+```
+dos/        DOS tools (build with Open Watcom 1.9+, 16-bit)
+  CISDUMP.C   dump any PC Card's CIS via an 82365-compatible controller
+  CFUPROBE.C  enable + identify + RAM test + detect + SOF + IRQ test
+  CFUENUM.C   bus reset + GET_DESCRIPTOR control transfer (needs CFUPROBE)
+win/        Windows 95/98 driver + diagnostic
+  vxd/CFU1.ASM   dynamically loadable VxD: ring-0 socket enable (with the
+                 COR-at-0xFC quirk), SL811 register/attr access ioctls,
+                 VPICD IRQ hook
+  diag/CFUDIAG.C Win32 console diagnostic: /ENUM /DETECT /SOF /IRQ /IDS
+                 /LIVE /PCIC and more; loads the VxD from its own directory
+  CFU1.INF       PnP install stub with the verified hardware ID
+  build.sh       cross-build on macOS (Open Watcom v2 + JWasm)
+  get-ddk.sh     fetch the Windows 98 DDK includes and patch them for JWasm
+  dist/          ready-to-run binaries
+```
+
+## Building
+
+The Windows binaries cross-build on a modern machine — no retro toolchain
+required on the target:
+
+1. Install [Open Watcom v2](https://github.com/open-watcom/open-watcom-v2)
+   (the snapshot tarball includes native macOS/Linux binaries) and build
+   [JWasm](https://github.com/Baron-von-Riedesel/JWasm).
+2. `win/get-ddk.sh` — downloads the Windows 98 DDK from the Internet
+   Archive and extracts + patches the VMM/VPICD/etc. includes for JWasm
+   (they are Microsoft-copyrighted, so they are not in this repo; the
+   patch pipeline is verified byte-reproducible).
+3. `win/build.sh` — produces `CFU1.VXD` and `CFUDIAG.EXE`.
+
+The DOS tools build on any DOS box with Open Watcom
+(`wcc -ms` + `wlink system dos`).
+
+## Using it on Windows 98
+
+Copy `win/dist/CFU1.VXD` and `CFUDIAG.EXE` to the same directory on the
+target machine, insert the card, and:
+
+```
+CFUDIAG /DETECT      enable the card, identify the SL811, test its RAM,
+                     report whether a USB device is attached
+CFUDIAG /ENUM        read the attached device's USB device descriptor
+                     (full three-stage control transfer, polled)
+CFUDIAG /IDS         list the PC Card PnP IDs Windows has recorded
+CFUDIAG /OFF         power the socket down
+```
+
+`CFUDIAG /SOCKET n`, `/BASE hex`, `/WIN hex` select other sockets, I/O
+bases, and attribute-window addresses. See TEST-ON-98.md and the source
+for the full switch list.
+
+## Status / roadmap
+
+- [x] Hardware reverse engineering (CIS quirk, decode map, SL811 errata)
+- [x] DOS proof: enable, SOF, IRQ delivery, control transfers
+- [x] Win98 VxD: ring-0 enable, register access, IRQ hook, ioctl API
+- [x] Win98 proof: device descriptor read through the VxD
+- [ ] PnP INF + CONFIGMG integration (auto-enable, Windows-assigned IRQ)
+- [ ] Transfer engine in the VxD (control/interrupt/bulk, NAK retry)
+- [ ] HID demo (mouse/keyboard input via the card)
+- [ ] Mass storage → drive letter
+
+## References
+
+* Cypress SL811HS datasheet (38-08008) and the Linux `sl811-hcd` /
+  `sl811_cs` drivers — the reference implementations for this chip
+* [RATOC's CFU1U FAQ](http://www.ratocsystems.com/english/support/faq/cfu1u.html)
+
+## License
+
+MIT — see [LICENSE](LICENSE).

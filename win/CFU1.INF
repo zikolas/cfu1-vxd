@@ -1,0 +1,29 @@
+; CFU1.INF - RATOC REX-CFU1 "USB HOST CF+ Card" (SL811HS USB 1.1 host)
+; Windows 95/98 null-driver install: names the device and stops the New
+; Hardware wizard from reprompting.  The functional driver path for now is
+; CFUDIAG.EXE + CFU1.VXD (dynamically loaded, no INF needed).
+;
+; VERIFIED hardware ID from the ThinkPad 235 registry (CFUDIAG /IDS):
+;   PCMCIA\RATOC-USB_HOST_CF+_CARD-57DD
+
+
+
+[Version]
+Signature="$CHICAGO$"
+Class=Unknown
+Provider=%Prov%
+LayoutFile=layout.inf
+
+[Manufacturer]
+%Mfg%=RATOC
+
+[RATOC]
+%CFU1.DeviceDesc%=CFU1.Install, PCMCIA\RATOC-USB_HOST_CF+_CARD-57DD
+
+[CFU1.Install]
+; no driver files: enable is done by CFU1.VXD loaded from CFUDIAG for now
+
+[Strings]
+Prov="zikolas"
+Mfg="RATOC Systems, Inc."
+CFU1.DeviceDesc="RATOC REX-CFU1 USB Host CF+ Card (SL811HS)"

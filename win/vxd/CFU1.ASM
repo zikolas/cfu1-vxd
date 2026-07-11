@@ -64,8 +64,10 @@ CFU_MSCCMD      equ 1019h       ; in: BYTE cdblen,dir; WORD datalen; 16 cdb;
                                 ;     [OUT data]  out: DWORD csw; [IN data]
 CFU_IOSREG      equ 101Ah       ; register with IOS; out: DWORD reg_result
 CFU_IOSSTAT     equ 101Bh       ; out: total, lastfunc, regresult, counts[16]
+CFU_MSCMOUNT    equ 101Ch       ; ring-0 enumerate + READ CAPACITY;
+                                ; out: DWORD blocks, DWORD block_size
 
-VXD_VERSION     equ 00010801h   ; 1.81 - IOS DDB create + AEP sequence (2c-i)
+VXD_VERSION     equ 00010802h   ; 1.82 - ring-0 mass-storage mount
 
 HIDRING_SLOTS   equ 32
 HIDSLOT_SIZE    equ 9
@@ -170,7 +172,7 @@ ct_mps          db      8
 ct_wlen         dd      0               ; wanted IN data length (<= mps here)
 ct_got          dd      0
 ct_setup        db      8 dup (0)
-ct_buf          db      16 dup (0)
+ct_buf          db      72 dup (0)      ; control-transfer IN buffer
 
 ; hot-plug supervisor state
 sup_handle      dd      0
@@ -612,6 +614,8 @@ close_keep:
         je      ioc_iosreg
         cmp     eax, CFU_IOSSTAT
         je      ioc_iosstat
+        cmp     eax, CFU_MSCMOUNT
+        je      ioc_mscmount
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -1609,6 +1613,30 @@ ioc_iosstat:
 @@:     xor     eax, eax
         ret
 
+; CFU_MSCMOUNT: enumerate + read capacity in ring 0; out: blocks, block_size
+ioc_mscmount:
+        cmp     [enabled], 0
+        je      ioc_notena
+        mov     [xbusy], 1
+        call    msc_mount
+        mov     [xbusy], 0
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      mm2_done
+        cmp     [esi.cbOutBuffer], 8
+        jb      mm2_done
+        mov     eax, [msc_blocks]
+        mov     [edx], eax
+        mov     eax, [msc_bsize]
+        mov     [edx+4], eax
+        mov     ecx, [esi.lpcbBytesReturned]
+        test    ecx, ecx
+        jz      mm2_done
+        mov     dword ptr [ecx], 8
+mm2_done:
+        xor     eax, eax
+        ret
+
 ioc_notena:
         mov     eax, CFUERR_NOTENAB
         ret
@@ -1899,6 +1927,11 @@ msc_databuf     dd      0               ; linear address of data buffer
 msc_cdb         db      16 dup (0)
 msc_cbw         db      31 dup (0)
 msc_csw         db      16 dup (0)
+msc_cap         db      8 dup (0)       ; READ CAPACITY result
+msc_blocks      dd      0               ; total block count
+msc_bsize       dd      512             ; bytes per block
+msc_mounted     db      0
+                db      3 dup (0)
 
 ; --- IOS registration (Stage 2 of drive-letter): DRP + ILB + AEP log ---
 cfu_drp         DRP     <EyeCatcher, DRP_MISC_PD, OFFSET32 CFU1_IosAer, \
@@ -2150,6 +2183,156 @@ mbt_fail:
         stc
         ret
 EndProc msc_bot
+
+;----------------------------------------------------------------------------
+; do_usbinit_fs: bus reset + full-speed host init in ring 0 (task time).
+;----------------------------------------------------------------------------
+BeginProc do_usbinit_fs
+        mov     al, 06h                 ; INTENA off
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 05h                 ; CTL1 SE0 (USB reset)
+        mov     ah, 08h
+        call    sl_wr
+        mov     ecx, 30000
+        call    iodelay
+        mov     al, 05h
+        mov     ah, 00h
+        call    sl_wr
+        mov     ecx, 3000
+        call    iodelay
+        mov     al, 0Eh                 ; SOF counter low
+        mov     ah, 0E0h
+        call    sl_wr
+        mov     al, 0Fh                 ; CTL2 HOST | SOF-high (full speed)
+        mov     ah, 0AEh
+        call    sl_wr
+        mov     al, 02h                 ; SOF kickstart
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 03h
+        mov     ah, 50h
+        call    sl_wr
+        mov     al, 04h
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 00h
+        mov     ah, 01h
+        call    sl_wr
+        mov     al, 05h                 ; CTL1 SOF_ENA
+        mov     ah, 01h
+        call    sl_wr
+        mov     al, 0Dh
+        mov     ah, 0FFh
+        call    sl_wr
+        mov     al, 06h                 ; INTENA SOF-timer gate
+        mov     ah, 10h
+        call    sl_wr
+        mov     ecx, 100000             ; ~100ms recovery
+        call    iodelay
+        ret
+EndProc do_usbinit_fs
+
+;----------------------------------------------------------------------------
+; msc_mount: enumerate a direct-attached Bulk-Only mass-storage device in
+; ring 0 and read its capacity.  Assumes bulk IN 0x81 / OUT 0x02 (the
+; standard flash-drive layout).  Fills msc_addr/blocks/bsize.  CF on error.
+;----------------------------------------------------------------------------
+BeginProc msc_mount
+        mov     byte ptr [msc_mounted], 0
+        call    sup_stop
+        call    hid_stop
+        call    do_usbinit_fs
+
+        mov     al, 80h                 ; GET_DESCRIPTOR(device,8) @ addr 0
+        mov     ah, 06h
+        mov     bx, 0100h
+        xor     cx, cx
+        mov     dx, 8
+        call    setup_pkt
+        mov     byte ptr [ct_addr], 0
+        mov     byte ptr [ct_mps], 8
+        mov     dword ptr [ct_wlen], 8
+        call    do_control
+        jc      mnt_fail
+
+        mov     al, 00h                 ; SET_ADDRESS 1 @ addr 0
+        mov     ah, 05h
+        mov     bx, 1
+        xor     cx, cx
+        xor     dx, dx
+        call    setup_pkt
+        mov     byte ptr [ct_addr], 0
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        jc      mnt_fail
+        mov     ecx, 5000
+        call    iodelay
+
+        mov     al, 00h                 ; SET_CONFIGURATION 1 @ addr 1
+        mov     ah, 09h
+        mov     bx, 1
+        xor     cx, cx
+        xor     dx, dx
+        call    setup_pkt
+        mov     byte ptr [ct_addr], 1
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        jc      mnt_fail
+
+        mov     byte ptr [msc_addr], 1
+        mov     byte ptr [msc_epin], 81h
+        mov     byte ptr [msc_epout], 2
+        mov     byte ptr [msc_togin], 0
+        mov     byte ptr [msc_togout], 0
+        mov     dword ptr [msc_tag], 1
+
+        ; SCSI READ CAPACITY(10)
+        push    edi
+        cld
+        xor     eax, eax
+        mov     edi, OFFSET32 msc_cdb
+        mov     ecx, 4
+        rep     stosd                   ; zero the 16-byte CDB
+        pop     edi
+        mov     byte ptr [msc_cdb], 25h
+        mov     byte ptr [msc_cdblen], 10
+        mov     byte ptr [msc_dir], 1
+        mov     dword ptr [msc_datalen], 8
+        mov     dword ptr [msc_databuf], OFFSET32 msc_cap
+        call    msc_bot
+        jc      mnt_fail
+        test    al, al                  ; CSW status 0 = good
+        jnz     mnt_fail
+
+        ; last LBA (big-endian) -> block count
+        movzx   eax, byte ptr [msc_cap+0]
+        shl     eax, 8
+        mov     al, [msc_cap+1]
+        shl     eax, 8
+        mov     al, [msc_cap+2]
+        shl     eax, 8
+        mov     al, [msc_cap+3]
+        inc     eax
+        mov     [msc_blocks], eax
+        movzx   eax, byte ptr [msc_cap+4]
+        shl     eax, 8
+        mov     al, [msc_cap+5]
+        shl     eax, 8
+        mov     al, [msc_cap+6]
+        shl     eax, 8
+        mov     al, [msc_cap+7]
+        test    eax, eax
+        jnz     @F
+        mov     eax, 512
+@@:     mov     [msc_bsize], eax
+        mov     byte ptr [msc_mounted], 1
+        clc
+        ret
+mnt_fail:
+        stc
+        ret
+EndProc msc_mount
 
 ;----------------------------------------------------------------------------
 ; setup_pkt: fill ct_setup with AL=bmRequestType AH=bRequest BX=wValue

@@ -505,10 +505,12 @@ int main(int argc, char **argv)
     unsigned char inq[36], sec[512], sense[18];
     int i, want_sec = -1, want_dir = 0, r;
 
+    int mount_r0 = 0;
     for (i = 1; i < argc; i++) {
         if (!stricmp(argv[i], "/SEC") && i + 1 < argc) want_sec = atoi(argv[++i]);
         else if (!stricmp(argv[i], "/DIR")) want_dir = 1;
         else if (!stricmp(argv[i], "/R0")) g_ring0 = 1;
+        else if (!stricmp(argv[i], "/MOUNT")) { mount_r0 = 1; g_ring0 = 1; }
     }
 
     printf("CFUDISK - USB mass storage on the REX-CFU1\n");
@@ -517,7 +519,17 @@ int main(int argc, char **argv)
         printf("cannot load CFU1.VXD (%lu)\n", GetLastError());
         return 1;
     }
-    if (enumerate() != 0) { CloseHandle(hVxd); return 1; }
+    if (mount_r0) {
+        DWORD cap[2]; cap[0] = cap[1] = 0;
+        if (vxd_ioctl(CFU_MSCMOUNT, NULL, 0, cap, 8) != 0 || cap[0] == 0) {
+            printf("VxD ring-0 mount failed (blocks=%lu)\n", cap[0]);
+            CloseHandle(hVxd); return 1;
+        }
+        g_blocks = cap[0]; g_bsize = cap[1];
+        printf("VxD ring-0 mount OK: %lu blocks x %lu bytes = %.1f MB\n",
+               cap[0], cap[1], (double)cap[0]*cap[1]/(1024.0*1024.0));
+        /* VxD already set its msc state; commands run ring-0 (g_ring0=1) */
+    } else if (enumerate() != 0) { CloseHandle(hVxd); return 1; }
 
     /* spin up / wait ready */
     for (i = 0; i < 20; i++) {

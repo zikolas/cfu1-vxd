@@ -33,6 +33,7 @@
                                    out: DWORD csw, in-data                  */
 #define CFU_IOSREG      0x101A  /* register with IOS; out: DWORD reg_result */
 #define CFU_IOSSTAT     0x101B  /* out: total, lastfunc, regresult, cnt[16] */
+#define CFU_MSCMOUNT    0x101C  /* ring-0 enumerate; out: blocks, block_size*/
 
 #pragma pack(push, 1)
 typedef struct {

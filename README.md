@@ -12,17 +12,38 @@ CE drivers for it; this project makes the card work on PCs.
 *The REX-CFU1 with its USB-A dongle, seated in an IBM Microdrive
 CF-to-PC-Card adapter — as tested in a ThinkPad 235.*
 
-Current state: **a working, installable USB mouse driver for Windows
-98.** Insert the card and Windows PnP-installs it (INF + CONFIGMG-
-integrated VxD, auto-enabled at boot); plug a USB mouse into the card at
-any time and a ring-0 hot-plug supervisor enumerates it and feeds
-Windows' pointer via VMOUSE — no commands, hot-unplug/replug safe. USB
-keyboards work too (one CFUKBD command arms a ring-0 feed that types
-into Windows via VKD, with typematic repeat). The
-same VxD exposes a full polled USB transfer engine (control + interrupt
-transfers, enumeration, HID streaming) over a simple ioctl API. Mass
-storage reads work (Bulk-Only Transport + SCSI + FAT, ring-3 over the
-VxD); a real drive letter and full hub support are the next steps.
+Current state: **USB mouse, USB keyboard, and a real read/write drive
+letter for USB sticks, on Windows 98.** Insert the card and Windows
+PnP-installs it (INF + CONFIGMG-integrated VxD, auto-enabled at boot);
+plug a USB mouse into the card at any time and a ring-0 hot-plug
+supervisor enumerates it and feeds Windows' pointer via VMOUSE — no
+commands, hot-unplug/replug safe. USB keyboards work too (one CFUKBD
+command arms a ring-0 feed that types into Windows via VKD, with
+typematic repeat). Plug in a USB stick and one `CFUDRV` command mounts
+it as a real drive letter — `DIR E:`, Explorer, reading *and writing*,
+all through the card (the VxD registers with Windows' I/O Supervisor as
+a port driver and acts as its own TSD; see below). The same VxD exposes
+a full polled USB transfer engine (control + interrupt + bulk) over a
+simple ioctl API.
+
+> ## ⚠️ Proof of concept — not for data you care about
+>
+> This is a research driver, built by probing undocumented hardware and
+> undocumented Windows internals on real machines. The drive-letter
+> support in particular is young: **do not plug in any USB drive whose
+> contents you would mind losing.** Strictly testing and fun only.
+> Specifically:
+>
+> * There is **no graceful unplug yet**. Windows may hold cached writes;
+>   yanking the stick (or the card) while the volume is mounted can
+>   corrupt the stick's filesystem. Shut down before removing.
+> * The volume is currently presented as a fixed disk, so VFAT may
+>   write-behind cache (making surprise removal *more* dangerous, not
+>   less).
+> * A wrong turn in the IOS layer can hang the whole storage stack —
+>   during development one experiment required a hard reset and assigned
+>   phantom drive letters A: through Z:. That path is gone, but treat
+>   the machine as a lab machine.
 
 ## Why no driver ever existed: the card's CIS lies
 
@@ -49,6 +70,43 @@ and a ThinkPad 235 under Windows 98) are documented in
 * Windows 98 gotchas: VxDs must be linked dynamically loadable; ring-3
   hardware access is silently virtualized; the OS PCMCIA layer races
   socket enables and shuts down sockets with unserviced interrupts
+
+## How the drive letter works (undocumented IOS findings)
+
+Windows 9x block storage is the IOS (I/O Supervisor) stack: port driver
+at the bottom, type-specific driver (DISKTSD) and volume tracker above,
+VFAT on top. This driver registers as a dynamically-loaded port driver
+(`IOS_Register`, `DRP_MISC_PD`) and everything below the TSD works as
+documented: IOS sends `AEP_INITIALIZE` → `AEP_DEVICE_INQUIRY` →
+`AEP_CONFIG_DCB`, the VxD enumerates the stick in ring 0, claims unit 0,
+fills the DCB's actual geometry and splices its request routine into the
+calldown. Then, three things the DDK does not tell you:
+
+1. **DISKTSD never configures a dynamically-registered port driver's
+   DCB.** The TSD layering pass only runs during boot-time
+   configuration; register after boot and your DCB sits forever with
+   `DCB_DEV_MUST_CONFIGURE` set — no partition scan, no drive letter.
+   (Verified by dumping the DCB and its calldown chain against the boot
+   HDD's, using the VxD's ring-0 peek ioctl.)
+2. **Do not try to fix that with `ISP_BROADCAST_AEP`** of
+   `AEP_CONFIG_DCB`: a layer driver deadlocks processing it, and the
+   volume tracker assigns phantom drive letters A: through Z:.
+3. The working approach: **be your own TSD.** The VxD reads the MBR in
+   ring 0, parses partition 1, creates a logical volume DCB itself
+   (`ISP_CREATE_DCB`; `DCB_Partition_Start`, geometry,
+   `DCB_DEV_LOGICAL`), links it to the physical DCB, and calls
+   `ISP_ASSOCIATE_DCB` — IFSMGR mounts the volume and the letter
+   appears. The AER must acknowledge the mount-time AEPs (16–19,
+   `DCB_LOCK`/`MOUNT_NOTIFY`/VRP create/destroy), the request routine
+   must honour `IORF_LOGICAL_START_SECTOR` (volume-relative LBAs), and —
+   the final trap — **`DCB_DEV_WRITEABLE` (0x02) must be set on both
+   DCBs** or VFAT silently mounts the volume write-protected.
+
+One more class of bug worth naming, because it bit three separate times:
+the DDK block samples use registers freely, and IOS calls your AER and
+request routine with live pointers in EBX/ESI. Every helper call that
+touches the USB engine trashes them — save and restore around *every*
+call, or enjoy page faults at addresses that took a map file to decode.
 
 ## Contents
 
@@ -114,6 +172,18 @@ CFUDIAG /OFF         power the socket down
 bases, and attribute-window addresses. See TEST-ON-98.md and the source
 for the full switch list.
 
+For the drive letter (⚠️ see the proof-of-concept warning above):
+
+```
+CFUDRV               with a USB stick in the card: registers the VxD
+                     with IOS, mounts the stick in ring 0, creates the
+                     logical volume and associates it -> E: appears,
+                     read/write. Run once per boot; shut down (don't
+                     yank) to remove.
+CPEEK <hexaddr> [n]  hexdump linear memory through the VxD (ring 0)
+CPEEK E              enumerate all of IOS's DCBs
+```
+
 ## Status / roadmap
 
 - [x] Hardware reverse engineering (CIS quirk, decode map, SL811 errata)
@@ -139,7 +209,15 @@ for the full switch list.
 - [~] USB hubs (hub descent implemented in CFUDISK: port power, reset,
       downstream re-address — not yet tested; also the road to mouse +
       keyboard at once)
-- [ ] Mass storage → real drive letter (needs an IOS-layer block driver)
+- [x] **Mass storage → real drive letter**: the VxD is an IOS port
+      driver *and* its own TSD — mounts a USB stick as a read/write
+      Windows drive letter (verified: DIR, TYPE, file creation through
+      VFAT on a 16 GB FAT32 stick)
+- [ ] Auto-arm the drive letter at boot (no CFUDRV run needed)
+- [ ] Graceful unplug/eject: present as removable (write-through cache),
+      detach detection → fail I/O fast → `ISP_DCB_DESTROY` teardown
+      (flushes + waits for pending I/O per the DDK), CFUEJECT flush
+      command, remount on replug
 - [ ] Interrupt-driven operation (IRQ delivery is blocked by chipset IRQ
       routing on the test machine; INF LogConfig override experiment
       pending — everything currently runs polled and works)

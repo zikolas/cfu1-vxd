@@ -20,6 +20,9 @@
 #define CFU_USBINIT     0x100D  /* in: BYTE lowspeed  out: DWORD INTSTAT    */
 #define CFU_XACT        0x100E  /* in: CFU_XREQ       out: CFU_XRSP         */
 #define CFU_CTRL        0x100F  /* in: CFU_CREQ       out: CFU_CRSP         */
+#define CFU_HIDSTART    0x1010  /* in: BYTE ep, devaddr, mps, interval_ms   */
+#define CFU_HIDSTOP     0x1011
+#define CFU_HIDREAD     0x1012  /* out: DWORD count + count*(1+8) bytes     */
 
 #pragma pack(push, 1)
 typedef struct {

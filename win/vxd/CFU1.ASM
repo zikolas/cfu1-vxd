@@ -44,8 +44,15 @@ CFU_GETCONF     equ 100Ch       ; out: CFU_CONF (PnP-assigned resources)
 CFU_USBINIT     equ 100Dh       ; in: BYTE lowspeed   out: DWORD INTSTAT
 CFU_XACT        equ 100Eh       ; in: CFU_XREQ        out: CFU_XRSP
 CFU_CTRL        equ 100Fh       ; in: CFU_CREQ        out: CFU_CRSP
+CFU_HIDSTART    equ 1010h       ; in: BYTE ep,devaddr,mps,interval_ms
+CFU_HIDSTOP     equ 1011h
+CFU_HIDREAD     equ 1012h       ; out: DWORD count + count*9 (len+8 data)
 
-VXD_VERSION     equ 00010200h   ; 1.20 - ring-0 USB transfer engine
+VXD_VERSION     equ 00010301h   ; 1.31 - timer-driven HID poll loop
+                                ;   (1.31 fixes the timeout handle register)
+
+HIDRING_SLOTS   equ 32
+HIDSLOT_SIZE    equ 9
 
 ; CFU_XREQ offsets (one raw transaction on EP A)
 XQ_PIDEP        equ 0           ; BYTE  PID<<4 | endpoint
@@ -135,7 +142,22 @@ xa_addr         db      0
 xa_ctl          db      0
 xa_len          db      0
 ct_toggle       db      0               ; control-transfer data toggle
-                db      3 dup (0)
+xbusy           db      0               ; EP A ownership guard (timer skips)
+                db      2 dup (0)
+xa_budget       dd      50000           ; do_xact completion poll budget
+
+; HID poll loop state
+hid_handle      dd      0               ; Set_Global_Time_Out handle (in ESI!)
+hid_ep          db      0
+hid_addr        db      0
+hid_mps         db      0
+hid_ivl         db      10
+hid_tog         db      0
+hid_run         db      0               ; 1 = keep polling (gate reschedule)
+                db      2 dup (0)
+hid_head        dd      0
+hid_tail        dd      0
+hidring         db      HIDRING_SLOTS*HIDSLOT_SIZE dup (0)
 cmconfig        Config_Buff_s <>
 VxD_LOCKED_DATA_ENDS
 
@@ -412,6 +434,7 @@ BeginProc CFU1_Init
 EndProc CFU1_Init
 
 BeginProc CFU1_Exit
+        call    hid_stop
         cmp     [irqhandle], 0
         jz      @F
         mov     eax, [irqhandle]
@@ -433,6 +456,7 @@ BeginProc CFU1_Ioctl
 @@:     cmp     eax, DIOC_CLOSEHANDLE           ; -1: cleanup on CloseHandle
         jne     @F
         call    ioc_unhook
+        call    hid_stop
         xor     eax, eax
         ret
 @@:
@@ -468,6 +492,12 @@ BeginProc CFU1_Ioctl
         je      ioc_xact
         cmp     eax, CFU_CTRL
         je      ioc_ctrl
+        cmp     eax, CFU_HIDSTART
+        je      ioc_hidstart
+        cmp     eax, CFU_HIDSTOP
+        je      ioc_hidstop
+        cmp     eax, CFU_HIDREAD
+        je      ioc_hidread
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -816,6 +846,7 @@ ioc_pcicwr:
 ioc_usbinit:
         cmp     [enabled], 0
         je      ioc_notena
+        call    hid_stop                ; a bus reset invalidates the poll
         mov     edx, [esi.lpvInBuffer]
         xor     ecx, ecx                ; CL = lowspeed flag
         test    edx, edx
@@ -899,6 +930,7 @@ ioc_xact:
         mov     [xa_ctl], al
         mov     al, [edx+XQ_LEN]
         mov     [xa_len], al
+        mov     [xbusy], 1              ; keep the HID timer off EP A
         ; copy any outbound payload into chip RAM
         push    esi                     ; preserve DIOCParams ptr
         test    byte ptr [xa_ctl], 04h
@@ -910,6 +942,7 @@ ioc_xact:
         call    buf_to_chip
 @@:
         call    do_xact
+        mov     [xbusy], 0
         pop     esi
         jnc     @F
         mov     eax, 0FFFFFFFFh         ; timeout marker
@@ -980,6 +1013,7 @@ ioc_ctrl:
 
         mov     al, [edx+CQ_DEVADDR]
         mov     [xa_addr], al
+        mov     [xbusy], 1              ; keep the HID timer off EP A
 
         ; ---- SETUP stage: 8 bytes, DATA0, OUT ----
         push    esi
@@ -1088,6 +1122,7 @@ ctrl_fail:
         mov     [edi+CR2_ERR], eax
         xor     eax, eax
 ctrl_out:
+        mov     [xbusy], 0
         mov     edx, [esi.lpcbBytesReturned]
         test    edx, edx
         jz      @F
@@ -1102,6 +1137,103 @@ ctrl_badbuf:
         pop     edi
         pop     ebx
         mov     eax, CFUERR_BUFFER
+        ret
+
+;----------------------------------------------------------------------------
+; HID poll loop control
+;----------------------------------------------------------------------------
+ioc_hidstart:
+        cmp     [enabled], 0
+        je      ioc_notena
+        cmp     [hid_handle], 0
+        jnz     ioc_badbuf              ; already running
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbInBuffer], 4
+        jb      ioc_badbuf
+        mov     al, [edx]
+        mov     [hid_ep], al
+        mov     al, [edx+1]
+        mov     [hid_addr], al
+        mov     al, [edx+2]
+        mov     [hid_mps], al
+        mov     al, [edx+3]
+        test    al, al
+        jnz     @F
+        mov     al, 10                  ; default 10ms
+@@:     mov     [hid_ivl], al
+        mov     [hid_tog], 0
+        mov     [hid_head], 0
+        mov     [hid_tail], 0
+        mov     [hid_run], 1
+        push    esi
+        movzx   eax, [hid_ivl]
+        xor     edx, edx
+        mov     esi, OFFSET32 CFU1_HidTick
+        VMMCall Set_Global_Time_Out
+        mov     [hid_handle], esi       ; handle returned in ESI
+        pop     esi
+        xor     eax, eax
+        ret
+
+ioc_hidstop:
+        call    hid_stop
+        xor     eax, eax
+        ret
+
+BeginProc hid_stop
+        mov     [hid_run], 0            ; stray in-flight tick won't re-arm
+        cmp     [hid_handle], 0
+        jz      @F
+        push    esi
+        mov     esi, [hid_handle]       ; Cancel_Time_Out takes ESI
+        mov     [hid_handle], 0
+        VMMCall Cancel_Time_Out
+        pop     esi
+@@:     ret
+EndProc hid_stop
+
+ioc_hidread:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], 4 + HIDRING_SLOTS*HIDSLOT_SIZE
+        jb      ioc_badbuf
+        push    ebx
+        push    edi
+        mov     edi, edx
+        add     edi, 4                  ; reports start after the count
+        xor     ebx, ebx                ; EBX = report count
+        mov     ecx, [hid_head]         ; snapshot: timer only advances head
+hr_loop:
+        mov     eax, [hid_tail]
+        cmp     eax, ecx
+        je      hr_done
+        push    ecx
+        push    esi
+        lea     esi, [eax+eax*8]
+        add     esi, OFFSET32 hidring
+        mov     ecx, HIDSLOT_SIZE
+        rep     movsb                   ; copy len byte + 8 data bytes
+        pop     esi
+        pop     ecx
+        inc     eax
+        and     eax, HIDRING_SLOTS-1
+        mov     [hid_tail], eax
+        inc     ebx
+        jmp     hr_loop
+hr_done:
+        mov     [edx], ebx              ; count
+        mov     eax, [esi.lpcbBytesReturned]
+        test    eax, eax
+        jz      @F
+        lea     ecx, [ebx+ebx*8]
+        add     ecx, 4
+        mov     [eax], ecx
+@@:     pop     edi
+        pop     ebx
+        xor     eax, eax
         ret
 
 ioc_notena:
@@ -1250,7 +1382,7 @@ BeginProc do_xact
         mov     al, 00h                 ; EP A host control: go
         mov     ah, [xa_ctl]
         call    sl_wr
-        mov     ecx, 50000              ; ~50ms completion budget
+        mov     ecx, [xa_budget]        ; completion budget (~us)
 dx_poll:
         mov     al, 0Dh
         call    sl_rd
@@ -1296,6 +1428,79 @@ dxr_out:
         pop     ebx
         ret
 EndProc do_xact_retry
+
+;----------------------------------------------------------------------------
+; HID poll timer: reschedules itself, then runs one interrupt-IN
+; transaction; ACKed data goes into the ring buffer.
+; Callback convention: EBX=VM, ECX=ms late, EDX=refdata.
+;----------------------------------------------------------------------------
+BeginProc CFU1_HidTick, High_Freq
+        cmp     [hid_run], 0
+        jz      ht_out                  ; stop requested: don't re-arm
+
+        movzx   eax, [hid_ivl]          ; reschedule first: steady cadence
+        xor     edx, edx
+        mov     esi, OFFSET32 CFU1_HidTick
+        VMMCall Set_Global_Time_Out
+        mov     [hid_handle], esi       ; handle comes back in ESI
+
+        cmp     [xbusy], 0              ; someone mid-transaction? skip tick
+        jnz     ht_out
+        mov     [xbusy], 1
+
+        mov     al, [hid_ep]
+        and     al, 0Fh
+        or      al, 90h                 ; IN | endpoint
+        mov     [xa_pidep], al
+        mov     al, [hid_addr]
+        mov     [xa_addr], al
+        mov     al, [hid_mps]
+        mov     [xa_len], al
+        mov     al, [hid_tog]
+        or      al, 03h                 ; ARM|ENABLE
+        mov     [xa_ctl], al
+        mov     [xa_budget], 3000       ; short budget at event time
+        call    do_xact
+        mov     [xa_budget], 50000
+        jc      ht_done                 ; timeout: leave toggle alone
+        test    al, 01h                 ; ACK?
+        jz      ht_done                 ; NAK/error: no data this tick
+        xor     [hid_tog], 40h
+        mov     al, 04h                 ; remaining
+        call    sl_rd
+        mov     ah, [hid_mps]
+        sub     ah, al
+        movzx   ecx, ah                 ; ECX = got
+        jecxz   ht_done
+        cmp     ecx, 8
+        jbe     @F
+        mov     ecx, 8                  ; slot payload cap
+@@:
+        ; store into ring slot at head
+        mov     eax, [hid_head]
+        lea     edx, [eax+eax*8]        ; head * 9
+        add     edx, OFFSET32 hidring
+        mov     [edx], cl               ; slot: len byte first
+        push    edi
+        lea     edi, [edx+1]
+        mov     al, 10h
+        call    buf_from_chip
+        pop     edi
+        mov     eax, [hid_head]
+        inc     eax
+        and     eax, HIDRING_SLOTS-1
+        mov     [hid_head], eax
+        cmp     eax, [hid_tail]         ; full? drop oldest
+        jne     ht_done
+        mov     eax, [hid_tail]
+        inc     eax
+        and     eax, HIDRING_SLOTS-1
+        mov     [hid_tail], eax
+ht_done:
+        mov     [xbusy], 0
+ht_out:
+        ret
+EndProc CFU1_HidTick
 
 ;----------------------------------------------------------------------------
 ; hardware interrupt handler: ack the SL811, count, EOI

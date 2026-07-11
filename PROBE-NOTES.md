@@ -268,3 +268,38 @@ Milestone status: enumeration + control + interrupt transfers DONE.
 Remaining on the roadmap: bulk transfers + mass storage (BOT + drive
 letter integration), IRQ routing archaeology (LogConfig override), HID
 poll loop in the VxD, multi-device support if a hub ever matters.
+
+## HID POLISH: THE MOUSE MOVES THE WINDOWS POINTER — 2026-07-11/12
+
+**CFUMOUSE.EXE drives the real Windows 98 cursor from a USB mouse plugged
+into the REX-CFU1** — enumerate (address 1, config 1, SET_PROTOCOL boot
+accepted by the Logitech receiver), start the in-VxD poll loop, drain
+reports, inject via mouse_event() (movement + 3 buttons with edge
+handling). Measured: 1324 reports / 1322 movements in 20s (66 rps at an
+8ms ring-0 poll).
+
+VxD 1.31 additions:
+* CFU_HIDSTART/HIDSTOP/HIDREAD: self-rescheduling Set_Global_Time_Out
+  poll loop at event time (short 3ms transaction budget), 32-slot ring
+  buffer (len+8 bytes/slot), toggle tracking, drop-oldest overflow.
+* xbusy guard: ioctl transaction paths (XACT/CTRL) own EP A and the
+  timer tick skips; timer owns EP A only within one tick.
+* hid_stop on DIOC_CLOSEHANDLE, SYS_DYNAMIC_DEVICE_EXIT, and before any
+  CFU_USBINIT (bus reset invalidates the poll target).
+
+**VxD lesson that cost a bluescreen (GPF 0D at teardown): VMM
+Set_Global_Time_Out RETURNS THE HANDLE IN ESI, and Cancel_Time_Out TAKES
+IT IN ESI — not EAX.** Confirmed from the DDK's own VXDWRAPS sources
+(SRC_BASE_VXDWRAPS_VMM_VMM15Z/16Z.ASM); scheduling works no matter where
+you think the handle is, so the bug only detonates at cancel time with
+whatever ESI held (the DIOCParams pointer). v1.30 -> v1.31. Also added
+hid_run flag so an in-flight tick can't re-arm after cancel.
+
+Win9x console gotcha: GetAsyncKeyState does not see keys focused into a
+DOS box, and unconsumed keys REPLAY at the DOS prompt on exit (ESC echoes
+a backslash at COMMAND.COM - hence a staircase of \ after the run).
+CFUMOUSE now uses kbhit/getch which both detects ESC and drains the queue.
+
+Remaining roadmap: mass storage (bulk + BOT + drive letter), IRQ
+LogConfig experiment, real VMD/VMOUSE integration (mouse_event is a demo
+vehicle; a proper mouse driver would feed VMOUSE at ring 0).

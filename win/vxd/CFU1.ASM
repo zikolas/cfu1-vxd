@@ -65,7 +65,7 @@ CFU_MSCCMD      equ 1019h       ; in: BYTE cdblen,dir; WORD datalen; 16 cdb;
 CFU_IOSREG      equ 101Ah       ; register with IOS; out: DWORD reg_result
 CFU_IOSSTAT     equ 101Bh       ; out: total, lastfunc, regresult, counts[16]
 
-VXD_VERSION     equ 00010800h   ; 1.80 - IOS registration probe (Stage 2b)
+VXD_VERSION     equ 00010801h   ; 1.81 - IOS DDB create + AEP sequence (2c-i)
 
 HIDRING_SLOTS   equ 32
 HIDSLOT_SIZE    equ 9
@@ -1583,7 +1583,7 @@ ioc_iosstat:
         mov     edx, [esi.lpvOutBuffer]
         test    edx, edx
         jz      ioc_badbuf
-        cmp     [esi.cbOutBuffer], 76    ; 3 dwords + 16 counts
+        cmp     [esi.cbOutBuffer], 80    ; 4 dwords + 16 counts
         jb      ioc_badbuf
         mov     eax, [aep_total]
         mov     [edx+0], eax
@@ -1591,11 +1591,13 @@ ioc_iosstat:
         mov     [edx+4], eax
         mov     eax, [ios_regresult]
         mov     [edx+8], eax
+        mov     eax, [cfu_ddb_ptr]
+        mov     [edx+12], eax
         push    esi
         push    edi
         cld
         mov     esi, OFFSET32 aep_counts
-        lea     edi, [edx+12]
+        lea     edi, [edx+16]
         mov     ecx, 16
         rep     movsd
         pop     edi
@@ -1603,7 +1605,7 @@ ioc_iosstat:
         mov     ecx, [esi.lpcbBytesReturned]
         test    ecx, ecx
         jz      @F
-        mov     dword ptr [ecx], 76
+        mov     dword ptr [ecx], 80
 @@:     xor     eax, eax
         ret
 
@@ -1906,7 +1908,9 @@ cfu_ilb         ILB     <>
 ios_regresult   dd      0
 aep_total       dd      0
 aep_lastfunc    dd      0
+cfu_ddb_ptr     dd      0               ; DDB IOS allocated for us
 aep_counts      dd      32 dup (0)
+CFU_DDB_SIZE    equ     32              ; = size DDB (header only)
 VxD_LOCKED_DATA_ENDS
 
 ;----------------------------------------------------------------------------
@@ -1918,6 +1922,8 @@ BeginProc CFU1_IosAer
         push    ebp
         mov     ebp, esp
         push    ebx
+        push    esi
+        push    edi
         mov     ebx, [ebp+8]            ; AEP pointer
         movzx   eax, word ptr [ebx]     ; AEP_func (offset 0)
         inc     dword ptr [aep_total]
@@ -1925,11 +1931,61 @@ BeginProc CFU1_IosAer
         cmp     eax, 32
         jae     @F
         inc     dword ptr [aep_counts + eax*4]
-@@:     mov     word ptr [ebx+2], 0FFFFh ; AEP_result = AEP_FAILURE
+@@:
+        movzx   eax, word ptr [ebx]
+        cmp     eax, 0                  ; AEP_INITIALIZE
+        je      aer_init
+        cmp     eax, 6                  ; AEP_DEVICE_INQUIRY
+        je      aer_inq
+        cmp     eax, 2                  ; AEP_BOOT_COMPLETE
+        je      aer_ok
+        cmp     eax, 3                  ; AEP_CONFIG_DCB
+        je      aer_ok
+        mov     word ptr [ebx+2], 0FFFFh ; default: AEP_FAILURE
+        jmp     aer_out
+aer_init:
+        call    ios_create_ddb
+        jc      aer_fail
+        mov     word ptr [ebx+2], 0     ; AEP_SUCCESS
+        jmp     aer_out
+aer_inq:
+        mov     word ptr [ebx+2], 2     ; AEP_NO_MORE_DEVICES (claim none yet)
+        jmp     aer_out
+aer_ok:
+        mov     word ptr [ebx+2], 0     ; AEP_SUCCESS
+        jmp     aer_out
+aer_fail:
+        mov     word ptr [ebx+2], 0FFFFh
+aer_out:
+        pop     edi
+        pop     esi
         pop     ebx
         pop     ebp
         ret
 EndProc CFU1_IosAer
+
+; ios_create_ddb: ask IOS to allocate our adapter DDB.  CF set on failure.
+BeginProc ios_create_ddb
+        sub     esp, 12                 ; ISP_ddb_create on the stack
+        mov     edi, esp
+        mov     word ptr [edi+0], 0     ; ISP_func = ISP_CREATE_DDB (0)
+        mov     word ptr [edi+2], 0     ; ISP_result
+        mov     word ptr [edi+4], CFU_DDB_SIZE
+        mov     dword ptr [edi+6], 0    ; ISP_ddb_ptr (out)
+        mov     byte ptr [edi+10], 0    ; ISP_ddb_flags
+        push    edi
+        call    dword ptr [cfu_ilb]     ; ILB_service_rtn (offset 0)
+        mov     eax, [edi+6]            ; ISP_ddb_ptr
+        add     esp, 12 + 4             ; ISP + pushed arg
+        mov     [cfu_ddb_ptr], eax
+        test    eax, eax
+        jz      icd_fail
+        clc
+        ret
+icd_fail:
+        stc
+        ret
+EndProc ios_create_ddb
 
 ; msc_bulk_out: ESI = linear src, ECX = length.  CF set on failure.
 BeginProc msc_bulk_out

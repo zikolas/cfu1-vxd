@@ -26,13 +26,13 @@ static const char *aepname(int f)
 }
 static void dumpstat(void)
 {
-    DWORD s[19]; int i;
+    DWORD s[20]; int i;
     memset(s, 0, sizeof s);
     if (ioc(CFU_IOSSTAT, NULL, 0, s, sizeof s) != 0) { printf("IOSSTAT failed\n"); return; }
-    printf("  total AEPs: %lu   last func: %lu (%s)   reg_result: %lu\n",
-           s[0], s[1], aepname((int)s[1]), s[2]);
+    printf("  total AEPs: %lu   last func: %lu (%s)   reg_result: %lu   DDB: %08lX\n",
+           s[0], s[1], aepname((int)s[1]), s[2], s[3]);
     for (i = 0; i < 16; i++)
-        if (s[3 + i]) printf("    func %2d (%-18s): %lu\n", i, aepname(i), s[3+i]);
+        if (s[4 + i]) printf("    func %2d (%-18s): %lu\n", i, aepname(i), s[4+i]);
 }
 int main(void)
 {

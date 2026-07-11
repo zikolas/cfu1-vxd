@@ -332,3 +332,36 @@ REX-CFU1. Remaining gap to "true" driver polish: auto-enumerate + auto-
 start the feed from CONFIG_START at boot (today it needs one CFUMOUSE
 /VMOUSE run per session), and wheel support (needs the HID report
 descriptor or Logitech's 16-bit report format instead of boot protocol).
+
+## HOT-PLUG AUTO-MOUSE SUPERVISOR — 2026-07-12
+
+**Zero-command operation achieved.** VxD 1.50 adds a ring-0 hot-plug
+supervisor: a self-rescheduling 250ms Set_Global_Time_Out state machine
+(idle -> SE0 reset [held across one tick] -> host init -> GET_DESCRIPTOR
+-> SET_ADDRESS -> SET_CONFIG -> SET_PROTOCOL(boot, failure tolerated) ->
+arm VMOUSE poll). Each tick does AT MOST one short control transfer with
+a tight NAK budget (xr_tries=10) so event-time stalls stay bounded —
+that's why it's a state machine, not one blocking enumerate. Detach
+detection: INTSTAT bit6 sampled while running; 3 consecutive absent
+ticks -> stop poll, return to idle (auto re-arm on replug). do_control =
+compact internal control-transfer engine (globals-based, single-packet
+IN); setup_pkt builds packets from registers.
+
+Started automatically from CONFIG_START when cor_fix succeeds, stopped
+on CONFIG_STOP/device-exit, and steps aside when manual USB ioctls run
+(USBINIT/HIDSTART call sup_stop). CFU_AUTOMOUSE on/off +
+CFU_AUTOSTAT (state/armed) ioctls; CFUMOUSE /AUTO enables + shows a live
+state trace, /NOAUTO disables.
+
+Verified on the 235: mouse works from Windows boot with no commands;
+unplug -> replug recovers by itself. Combined with the PnP install this
+is a complete consumer-grade driver experience.
+
+Wheel: still open. VMD_Post_Pointer_Message has NO Z axis (Win98 wheel
+arrives via WM_MOUSEWHEEL / mouse_event ring-3 plumbing), and boot-
+protocol reports carry no wheel byte. Plan: skip SET_PROTOCOL to stay in
+report protocol (8-byte Logitech reports: buttons@0, dx16@2, dy16@4,
+wheel byte position TBD - identify empirically with /HID while
+scrolling), add a report-protocol parse mode to the tick (post dx/dy/
+buttons; stash wheel in the ring), and a small resident helper
+(CFUWHEEL) that drains wheel deltas and emits mouse_event(WHEEL).

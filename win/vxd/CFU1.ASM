@@ -49,8 +49,10 @@ CFU_HIDSTART    equ 1010h       ; in: BYTE ep,devaddr,mps,interval_ms
                                 ;     [,BYTE mode: bit0 = post to VMOUSE]
 CFU_HIDSTOP     equ 1011h
 CFU_HIDREAD     equ 1012h       ; out: DWORD count + count*9 (len+8 data)
+CFU_AUTOMOUSE   equ 1013h       ; in: BYTE 1=on/0=off  (hot-plug supervisor)
+CFU_AUTOSTAT    equ 1014h       ; out: DWORD (b0 run, b1 armed, b8-15 state)
 
-VXD_VERSION     equ 00010400h   ; 1.40 - ring-0 VMOUSE pointer integration
+VXD_VERSION     equ 00010500h   ; 1.50 - hot-plug auto-mouse supervisor
 
 HIDRING_SLOTS   equ 32
 HIDSLOT_SIZE    equ 9
@@ -146,6 +148,25 @@ ct_toggle       db      0               ; control-transfer data toggle
 xbusy           db      0               ; EP A ownership guard (timer skips)
                 db      2 dup (0)
 xa_budget       dd      50000           ; do_xact completion poll budget
+xr_tries        dd      250             ; do_xact_retry NAK budget
+
+; do_control (internal control transfer) parameters/results
+ct_addr         db      0
+ct_mps          db      8
+                dw      0
+ct_wlen         dd      0               ; wanted IN data length (<= mps here)
+ct_got          dd      0
+ct_setup        db      8 dup (0)
+ct_buf          db      16 dup (0)
+
+; hot-plug supervisor state
+sup_handle      dd      0
+sup_run         db      0               ; auto-mouse enabled
+sup_armed       db      0               ; poll currently armed by supervisor
+sup_absent      db      0               ; consecutive "no device" ticks
+sup_state       db      0               ; enumeration state machine
+sup_mps         db      8
+                dw      0
 
 ; HID poll loop state
 hid_handle      dd      0               ; Set_Global_Time_Out handle (in ESI!)
@@ -277,11 +298,15 @@ ch_start:
 ch_start_noconf:
         or      [pnp_flags], 2          ; started
         call    cor_fix                 ; the reason this driver exists
-        mov     eax, CR_SUCCESS
+        cmp     [enabled], 0            ; if the card came up, watch for a mouse
+        jz      @F
+        call    sup_start
+@@:     mov     eax, CR_SUCCESS
         jmp     ch_done
 
 ch_stop:
         and     [pnp_flags], NOT 2
+        call    sup_stop
         mov     eax, CR_SUCCESS
 
 ch_done:
@@ -438,6 +463,7 @@ BeginProc CFU1_Init
 EndProc CFU1_Init
 
 BeginProc CFU1_Exit
+        call    sup_stop
         call    hid_stop
         cmp     [irqhandle], 0
         jz      @F
@@ -505,6 +531,10 @@ close_keep:
         je      ioc_hidstop
         cmp     eax, CFU_HIDREAD
         je      ioc_hidread
+        cmp     eax, CFU_AUTOMOUSE
+        je      ioc_automouse
+        cmp     eax, CFU_AUTOSTAT
+        je      ioc_autostat
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -853,6 +883,7 @@ ioc_pcicwr:
 ioc_usbinit:
         cmp     [enabled], 0
         je      ioc_notena
+        call    sup_stop                ; manual USB test takes over from auto
         call    hid_stop                ; a bus reset invalidates the poll
         mov     edx, [esi.lpvInBuffer]
         xor     ecx, ecx                ; CL = lowspeed flag
@@ -999,6 +1030,7 @@ xact_ret:
 ioc_ctrl:
         cmp     [enabled], 0
         je      ioc_notena
+        mov     [xr_tries], 250         ; generous NAK budget for ring-3 path
         push    ebx
         push    edi
         mov     edx, [esi.lpvInBuffer]
@@ -1152,6 +1184,7 @@ ctrl_badbuf:
 ioc_hidstart:
         cmp     [enabled], 0
         je      ioc_notena
+        call    sup_stop                ; manual poll replaces the supervisor
         cmp     [hid_handle], 0
         jnz     ioc_badbuf              ; already running
         mov     edx, [esi.lpvInBuffer]
@@ -1175,7 +1208,13 @@ ioc_hidstart:
         jb      @F
         mov     al, [edx+4]
         mov     [hid_mode], al
-@@:     mov     [hid_tog], 0
+@@:     call    hid_arm
+        xor     eax, eax
+        ret
+
+; hid_arm: start the poll loop from the hid_* globals (ep/addr/mps/ivl/mode)
+BeginProc hid_arm
+        mov     [hid_tog], 0
         mov     [hid_head], 0
         mov     [hid_tail], 0
         mov     [hid_run], 1
@@ -1186,8 +1225,8 @@ ioc_hidstart:
         VMMCall Set_Global_Time_Out
         mov     [hid_handle], esi       ; handle returned in ESI
         pop     esi
-        xor     eax, eax
         ret
+EndProc hid_arm
 
 ioc_hidstop:
         call    hid_stop
@@ -1248,6 +1287,34 @@ hr_done:
         pop     ebx
         xor     eax, eax
         ret
+
+ioc_automouse:
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     byte ptr [edx], 0
+        jz      am_off
+        cmp     [enabled], 0
+        je      ioc_notena
+        call    sup_start
+        xor     eax, eax
+        ret
+am_off:
+        call    sup_stop
+        xor     eax, eax
+        ret
+
+ioc_autostat:
+        movzx   eax, [sup_state]
+        shl     eax, 8
+        mov     al, 0
+        cmp     [sup_run], 0
+        jz      @F
+        or      al, 1
+@@:     cmp     [sup_armed], 0
+        jz      @F
+        or      al, 2
+@@:     jmp     ret_dword
 
 ioc_notena:
         mov     eax, CFUERR_NOTENAB
@@ -1421,7 +1488,7 @@ EndProc do_xact
 BeginProc do_xact_retry
         push    ebx
         push    ecx
-        mov     ebx, 250
+        mov     ebx, [xr_tries]
 dxr_try:
         call    do_xact
         jc      dxr_out                 ; timeout
@@ -1441,6 +1508,345 @@ dxr_out:
         pop     ebx
         ret
 EndProc do_xact_retry
+
+;----------------------------------------------------------------------------
+; do_control: internal control transfer used by the auto-mouse supervisor.
+; Params in globals: ct_setup[8], ct_addr, ct_mps, ct_wlen (single IN packet,
+; <= mps; enumeration never needs more).  IN data -> ct_buf, count -> ct_got.
+; Returns CF clear on success, CF set on any stage failure.  Caller sets
+; xr_tries to bound the event-time stall.
+;----------------------------------------------------------------------------
+BeginProc do_control
+        mov     [xbusy], 1
+        mov     al, [ct_addr]
+        mov     [xa_addr], al
+        mov     dword ptr [ct_got], 0
+
+        ; SETUP: 8 bytes, DATA0, OUT
+        push    esi
+        mov     esi, OFFSET32 ct_setup
+        mov     al, 10h
+        mov     ecx, 8
+        call    buf_to_chip
+        pop     esi
+        mov     [xa_pidep], 0D0h
+        mov     [xa_len], 8
+        mov     [xa_ctl], 07h
+        call    do_xact_retry
+        jc      dc_fail
+        test    al, 01h
+        jz      dc_fail
+
+        ; DATA (IN only, single packet)
+        mov     ecx, [ct_wlen]
+        jecxz   dc_status
+        test    byte ptr [ct_setup], 80h
+        jz      dc_status
+        mov     al, [ct_mps]
+        mov     [xa_len], al
+        mov     [xa_pidep], 90h         ; IN ep0
+        mov     [xa_ctl], 43h           ; ARM|ENABLE|DATA1
+        call    do_xact_retry
+        jc      dc_fail
+        test    al, 01h
+        jz      dc_fail
+        mov     al, 04h                 ; remaining
+        call    sl_rd
+        mov     ah, [xa_len]
+        sub     ah, al
+        movzx   ecx, ah                 ; ECX = got
+        mov     [ct_got], ecx
+        push    edi
+        mov     edi, OFFSET32 ct_buf
+        mov     al, 10h
+        call    buf_from_chip
+        pop     edi
+
+dc_status:
+        mov     [xa_len], 0
+        test    byte ptr [ct_setup], 80h
+        jz      dc_status_in
+        mov     [xa_pidep], 10h         ; OUT status after IN data
+        mov     [xa_ctl], 47h           ; ARM|ENABLE|OUT|DATA1
+        jmp     dc_st_go
+dc_status_in:
+        mov     [xa_pidep], 90h         ; IN status after no data
+        mov     [xa_ctl], 43h           ; ARM|ENABLE|DATA1
+dc_st_go:
+        call    do_xact_retry
+        jc      dc_fail
+        test    al, 01h
+        jz      dc_fail
+        mov     [xbusy], 0
+        clc
+        ret
+dc_fail:
+        mov     [xbusy], 0
+        stc
+        ret
+EndProc do_control
+
+;----------------------------------------------------------------------------
+; setup_pkt: fill ct_setup with AL=bmRequestType AH=bRequest BX=wValue
+;            CX=wIndex DX=wLength
+;----------------------------------------------------------------------------
+BeginProc setup_pkt
+        mov     [ct_setup+0], al
+        mov     [ct_setup+1], ah
+        mov     [ct_setup+2], bl
+        mov     [ct_setup+3], bh
+        mov     [ct_setup+4], cl
+        mov     [ct_setup+5], ch
+        mov     [ct_setup+6], dl
+        mov     [ct_setup+7], dh
+        ret
+EndProc setup_pkt
+
+;----------------------------------------------------------------------------
+; dev_present: quick attach check with the host idle.  AL=1 if attached.
+;----------------------------------------------------------------------------
+BeginProc dev_present
+        mov     al, 05h                 ; CTL1 = 0 (normal, no force)
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 0Dh                 ; clear INTSTAT
+        mov     ah, 0FFh
+        call    sl_wr
+        push    ecx
+        mov     ecx, 5000               ; ~5ms settle
+        call    iodelay
+        pop     ecx
+        mov     al, 0Dh
+        call    sl_rd
+        test    al, 40h                 ; bit6 = 1 -> NO device
+        jnz     dp_no
+        mov     al, 1
+        ret
+dp_no:  xor     al, al
+        ret
+EndProc dev_present
+
+;----------------------------------------------------------------------------
+; hot-plug supervisor: a self-rescheduling 250ms timer that enumerates a
+; boot mouse one short control transfer per tick (bounded event-time stall)
+; and arms the VMOUSE poll.  States: 0 idle, 1 reset-release, 2 getdesc,
+; 3 setaddr, 4 setconfig, 5 setproto+arm, 9 running.
+;----------------------------------------------------------------------------
+BeginProc CFU1_SupTick, High_Freq
+        cmp     [sup_run], 0
+        jz      sup_out                 ; disabled: don't re-arm
+
+        mov     eax, 250                ; reschedule
+        xor     edx, edx
+        mov     esi, OFFSET32 CFU1_SupTick
+        VMMCall Set_Global_Time_Out
+        mov     [sup_handle], esi
+
+        cmp     [enabled], 0
+        jz      sup_out
+        cmp     [xbusy], 0              ; a real transfer owns EP A: wait
+        jnz     sup_out
+        mov     [xr_tries], 10          ; tight NAK budget at event time
+
+        movzx   eax, [sup_state]
+        cmp     eax, 9
+        je      sup_running
+        cmp     eax, 0
+        je      sup_idle
+        cmp     eax, 1
+        je      sup_reset
+        cmp     eax, 2
+        je      sup_getdesc
+        cmp     eax, 3
+        je      sup_setaddr
+        cmp     eax, 4
+        je      sup_setcfg
+        cmp     eax, 5
+        je      sup_setproto
+        mov     [sup_state], 0
+        jmp     sup_out
+
+sup_idle:
+        call    dev_present
+        test    al, al
+        jz      sup_out
+        mov     al, 05h                 ; assert SE0 (start USB reset)
+        mov     ah, 08h
+        call    sl_wr
+        mov     [sup_state], 1          ; hold SE0 until next tick (~250ms)
+        jmp     sup_out
+
+sup_reset:
+        mov     al, 05h                 ; release SE0
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 0Eh                 ; SOF counter low
+        mov     ah, 0E0h
+        call    sl_wr
+        mov     al, 0Fh                 ; CTL2: HOST | SOF-high (full speed)
+        mov     ah, 0AEh
+        call    sl_wr
+        mov     al, 02h                 ; SOF kickstart: EP A len 0
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 03h
+        mov     ah, 50h                 ; PID=SOF ep0
+        call    sl_wr
+        mov     al, 04h
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 00h                 ; ARM
+        mov     ah, 01h
+        call    sl_wr
+        mov     al, 05h                 ; CTL1: SOF_ENA
+        mov     ah, 01h
+        call    sl_wr
+        mov     al, 0Dh
+        mov     ah, 0FFh
+        call    sl_wr
+        mov     al, 06h                 ; INTENA bit4 gates SOF timer
+        mov     ah, 10h
+        call    sl_wr
+        mov     ecx, 15000              ; ~15ms recovery (rest via next tick)
+        call    iodelay
+        mov     [sup_state], 2
+        jmp     sup_out
+
+sup_getdesc:
+        mov     al, 80h                 ; GET_DESCRIPTOR(device,8) @ addr 0
+        mov     ah, 06h
+        mov     bx, 0100h               ; wValue = device desc, index 0
+        xor     cx, cx
+        mov     dx, 8
+        call    setup_pkt
+        mov     [ct_addr], 0
+        mov     [ct_mps], 8
+        mov     dword ptr [ct_wlen], 8
+        call    do_control
+        jc      sup_reidle
+        cmp     dword ptr [ct_got], 8
+        jb      sup_reidle
+        mov     al, [ct_buf+7]          ; bMaxPacketSize0
+        test    al, al
+        jnz     @F
+        mov     al, 8
+@@:     mov     [sup_mps], al
+        mov     [sup_state], 3
+        jmp     sup_out
+
+sup_setaddr:
+        mov     al, 00h                 ; SET_ADDRESS 1 @ addr 0
+        mov     ah, 05h
+        mov     bx, 1
+        xor     cx, cx
+        xor     dx, dx
+        call    setup_pkt
+        mov     [ct_addr], 0
+        mov     al, [sup_mps]
+        mov     [ct_mps], al
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        jc      sup_reidle
+        mov     [sup_state], 4
+        jmp     sup_out
+
+sup_setcfg:
+        mov     al, 00h                 ; SET_CONFIGURATION 1 @ addr 1
+        mov     ah, 09h
+        mov     bx, 1
+        xor     cx, cx
+        xor     dx, dx
+        call    setup_pkt
+        mov     [ct_addr], 1
+        mov     al, [sup_mps]
+        mov     [ct_mps], al
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        jc      sup_reidle
+        mov     [sup_state], 5
+        jmp     sup_out
+
+sup_setproto:
+        mov     al, 21h                 ; SET_PROTOCOL(boot) @ addr 1, iface 0
+        mov     ah, 0Bh
+        xor     bx, bx                  ; wValue = 0 (boot)
+        xor     cx, cx
+        xor     dx, dx
+        call    setup_pkt
+        mov     [ct_addr], 1
+        mov     al, [sup_mps]
+        mov     [ct_mps], al
+        mov     dword ptr [ct_wlen], 0
+        call    do_control              ; ignore result (some mice STALL it)
+        ; arm the VMOUSE poll: ep1, addr1, mps8 (boot report), 8ms
+        mov     [hid_ep], 1
+        mov     [hid_addr], 1
+        mov     [hid_mps], 8
+        mov     [hid_ivl], 8
+        mov     [hid_mode], 1           ; post to VMOUSE
+        call    hid_arm
+        mov     [sup_armed], 1
+        mov     [sup_absent], 0
+        mov     [sup_state], 9
+        jmp     sup_out
+
+sup_running:
+        mov     al, 0Dh                 ; live presence (SOF running)
+        call    sl_rd
+        test    al, 40h                 ; bit6 = no device
+        jz      sup_still
+        inc     [sup_absent]
+        cmp     [sup_absent], 3
+        jb      sup_out
+        call    hid_stop
+        mov     [sup_armed], 0
+        mov     [sup_absent], 0
+        mov     [sup_state], 0
+        jmp     sup_out
+sup_still:
+        mov     [sup_absent], 0
+        jmp     sup_out
+
+sup_reidle:                             ; enumeration step failed: retry later
+        mov     [sup_state], 0
+sup_out:
+        ret
+EndProc CFU1_SupTick
+
+; sup_start: begin the supervisor if not already running (ESI-safe)
+BeginProc sup_start
+        cmp     [sup_run], 0
+        jnz     ss_done
+        mov     [sup_run], 1
+        mov     [sup_armed], 0
+        mov     [sup_absent], 0
+        mov     [sup_state], 0
+        push    esi
+        mov     eax, 250
+        xor     edx, edx
+        mov     esi, OFFSET32 CFU1_SupTick
+        VMMCall Set_Global_Time_Out
+        mov     [sup_handle], esi
+        pop     esi
+ss_done:
+        ret
+EndProc sup_start
+
+BeginProc sup_stop
+        mov     [sup_run], 0
+        cmp     [sup_handle], 0
+        jz      @F
+        push    esi
+        mov     esi, [sup_handle]
+        mov     [sup_handle], 0
+        VMMCall Cancel_Time_Out
+        pop     esi
+@@:     cmp     [sup_armed], 0
+        jz      @F
+        call    hid_stop
+        mov     [sup_armed], 0
+@@:     ret
+EndProc sup_stop
 
 ;----------------------------------------------------------------------------
 ; HID poll timer: reschedules itself, then runs one interrupt-IN

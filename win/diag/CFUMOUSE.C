@@ -76,7 +76,7 @@ int main(int argc, char **argv)
     unsigned got = 0, i, o;
     unsigned prevbtn = 0;
     unsigned long nrep = 0, nmove = 0;
-    int seconds = 60, ep = 1, speed, vmouse = 0, stop = 0;
+    int seconds = 60, ep = 1, speed, vmouse = 0, stop = 0, auto_ = 0, noauto = 0;
     DWORD t0, st;
 
     for (i = 1; i < (unsigned)argc; i++) {
@@ -84,6 +84,8 @@ int main(int argc, char **argv)
             ep = atoi(argv[++i]);
         else if (!stricmp(argv[i], "/VMOUSE")) vmouse = 1;
         else if (!stricmp(argv[i], "/STOP")) stop = 1;
+        else if (!stricmp(argv[i], "/AUTO")) auto_ = 1;
+        else if (!stricmp(argv[i], "/NOAUTO")) noauto = 1;
         else seconds = atoi(argv[i]);
     }
     if (seconds <= 0) seconds = 60;
@@ -98,6 +100,43 @@ int main(int argc, char **argv)
     if (stop) {
         vxd_ioctl(CFU_HIDSTOP, NULL, 0, NULL, 0);
         printf("ring-0 pointer feed stopped.\n");
+        CloseHandle(hVxd);
+        return 0;
+    }
+
+    if (noauto) {
+        unsigned char off = 0;
+        vxd_ioctl(CFU_AUTOMOUSE, &off, 1, NULL, 0);
+        printf("auto-mouse supervisor disabled.\n");
+        CloseHandle(hVxd);
+        return 0;
+    }
+
+    if (auto_) {
+        unsigned char on = 1;
+        static const char *sname[] = {
+            "idle (watching for a mouse)", "bus reset", "get descriptor",
+            "set address", "set config", "set protocol / arm", "?", "?",
+            "?", "RUNNING (mouse live)" };
+        DWORD s;
+        int k;
+        if (vxd_ioctl(CFU_AUTOMOUSE, &on, 1, NULL, 0) != 0) {
+            printf("AUTOMOUSE failed (%lu)\n", GetLastError());
+            CloseHandle(hVxd);
+            return 1;
+        }
+        printf("auto-mouse supervisor ENABLED - plug a USB mouse into the\n"
+               "card anytime and it becomes a working mouse, no commands.\n"
+               "This survives app exit and reboots (armed from CONFIG_START).\n");
+        for (k = 0; k < 12; k++) {      /* show it enumerate, if present now */
+            s = 0;
+            vxd_ioctl(CFU_AUTOSTAT, NULL, 0, &s, 4);
+            printf("  state: %s%s\n", sname[(s >> 8) & 15],
+                   (s & 2) ? "  [ARMED]" : "");
+            if (s & 2) break;
+            Sleep(400);
+        }
+        printf("(disable with CFUMOUSE /NOAUTO)\n");
         CloseHandle(hVxd);
         return 0;
     }

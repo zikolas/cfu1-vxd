@@ -5,11 +5,14 @@ CF+ Card"** — a CompactFlash-sized USB 1.1 host controller card built
 around the Cypress/ScanLogic **SL811HS**. RATOC only ever shipped Windows
 CE drivers for it; this project makes the card work on PCs.
 
-Current state: the card enables, identifies, and **performs USB
-transactions on Windows 98 through the included VxD** (device descriptor
-read from an attached device, polled transfers). A proper PnP driver with
-Windows-assigned IRQ, an in-VxD transfer engine, and class support (HID,
-mass storage) are the roadmap.
+Current state: **a working, installable USB mouse driver for Windows
+98.** Insert the card and Windows PnP-installs it (INF + CONFIGMG-
+integrated VxD, auto-enabled at boot); plug a USB mouse into the card at
+any time and a ring-0 hot-plug supervisor enumerates it and feeds
+Windows' pointer via VMOUSE — no commands, hot-unplug/replug safe. The
+same VxD exposes a full polled USB transfer engine (control + interrupt
+transfers, enumeration, HID streaming) over a simple ioctl API. Mass
+storage and keyboard support are next on the roadmap.
 
 ## Why no driver ever existed: the card's CIS lies
 
@@ -79,10 +82,20 @@ Copy `win/dist/CFU1.VXD` and `CFUDIAG.EXE` to the same directory on the
 target machine, insert the card, and:
 
 ```
+CFUMOUSE /AUTO       enable the hot-plug supervisor: any USB mouse
+                     plugged into the card just works (this is also
+                     armed automatically at boot once the INF-installed
+                     driver starts, so normally you never run anything)
+CFUMOUSE /NOAUTO     disable the supervisor
+CFUMOUSE /VMOUSE     one-shot: enumerate + arm the ring-0 pointer feed
+CFUMOUSE /STOP       stop the pointer feed
+
+CFUDIAG /CONF        show the PnP state (assigned resources, COR fix)
 CFUDIAG /DETECT      enable the card, identify the SL811, test its RAM,
                      report whether a USB device is attached
-CFUDIAG /ENUM        read the attached device's USB device descriptor
-                     (full three-stage control transfer, polled)
+CFUDIAG /ENUM2       full enumeration: SET_ADDRESS, descriptors, VID/PID,
+                     config parse, SET_CONFIGURATION
+CFUDIAG /HID n       stream interrupt-IN reports from endpoint n
 CFUDIAG /IDS         list the PC Card PnP IDs Windows has recorded
 CFUDIAG /OFF         power the socket down
 ```
@@ -97,10 +110,22 @@ for the full switch list.
 - [x] DOS proof: enable, SOF, IRQ delivery, control transfers
 - [x] Win98 VxD: ring-0 enable, register access, IRQ hook, ioctl API
 - [x] Win98 proof: device descriptor read through the VxD
-- [ ] PnP INF + CONFIGMG integration (auto-enable, Windows-assigned IRQ)
-- [ ] Transfer engine in the VxD (control/interrupt/bulk, NAK retry)
-- [ ] HID demo (mouse/keyboard input via the card)
-- [ ] Mass storage → drive letter
+- [x] PnP INF + CONFIGMG integration: auto-install, auto-enable at boot,
+      Windows-assigned resources (COR quirk applied in CONFIG_START)
+- [x] Ring-0 transfer engine (control + interrupt transfers, NAK retry,
+      data toggles, full enumeration, HID report streaming)
+- [x] USB mouse driver: ring-0 VMOUSE injection, movement + 3 buttons,
+      survives app exit
+- [x] Hot-plug auto-mouse supervisor: works from boot with zero commands,
+      unplug/replug safe
+- [ ] Mouse wheel (report-protocol parse + ring-3 helper; Win98's VMOUSE
+      service has no Z axis)
+- [ ] USB keyboard (VKD_Force_Keys injection, HID→scan-code table, report
+      diffing, typematic synthesis, supervisor device-type detection)
+- [ ] Bulk transfers + mass storage → drive letter
+- [ ] Interrupt-driven operation (IRQ delivery is blocked by chipset IRQ
+      routing on the test machine; INF LogConfig override experiment
+      pending — everything currently runs polled and works)
 
 ## References
 

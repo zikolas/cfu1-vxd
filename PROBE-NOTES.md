@@ -401,3 +401,35 @@ we build a hub layer. Devices with built-in USB ports will generally be
 hubs. Vortex/plain keyboards are direct HID (class 00 / iface 03-01-01).
 Caps-lock LED needs a SET_REPORT output report (not sent yet) — LED
 never lighting is NOT a failure indicator.
+
+## USB MASS STORAGE — 2026-07-12
+
+**Reading files off a USB stick on Win98 via the card.** CFUDISK.EXE is
+entirely ring-3: it drives the resident VxD through CFU_CTRL (control) and
+CFU_XACT (raw bulk transactions), so NO new VxD code and NO reboot were
+needed — the whole mass-storage stack iterated against the resident 1.64
+VxD. Layers: enumeration (+ optional hub descent) -> find the Bulk-Only
+mass-storage interface (class 08 / subclass 06 / protocol 50) and its bulk
+IN/OUT endpoints -> Bulk-Only Transport (CBW 'USBC' / data / CSW 'USBS',
+per-endpoint data toggles, CLEAR_FEATURE on stall) -> SCSI (INQUIRY,
+TEST UNIT READY, REQUEST SENSE, READ CAPACITY, READ(10)) -> MBR partition
+parse -> FAT12/16/32 boot sector -> root directory walk (FAT32 root is a
+cluster chain via fat32_next(); FAT12/16 is the fixed region).
+
+Verified on the 235 with a SanDisk Ultra USB 3.0 16GB (FAT32): correct
+INQUIRY strings, 14.66 GB capacity, MBR type-0B partition, and a root
+listing that showed the two test files (HELLO, YAY) plus macOS's
+SPOTLI~1 directory. CFUDISK /SEC n hex-dumps any sector; /DIR lists root.
+
+Key facts: CFU_XACT already does everything bulk needs (arbitrary
+PID/ep/addr, data-toggle bit 0x40, <=120-byte packets, single-shot so the
+tool does NAK retry). Bulk packets capped at 64 (full-speed mps). The
+device is full-speed on this USB 1.1 host; a USB 3.0 stick negotiates
+down fine. Hub descent (power ports, GET_STATUS, PORT_RESET, re-address
+downstream at addr 2) is implemented in CFUDISK but untested (stick is
+direct-attach). Watcom C is C89: no mid-block declarations, no compound
+literals.
+
+Still ring-3 request/response, not a drive letter. Drive-letter mounting
+needs an IOS-layer block driver (or a DOS device driver under real-mode)
+- the big remaining piece for "it shows up as E:".

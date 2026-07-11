@@ -21,7 +21,8 @@ keyboards work too (one CFUKBD command arms a ring-0 feed that types
 into Windows via VKD, with typematic repeat). The
 same VxD exposes a full polled USB transfer engine (control + interrupt
 transfers, enumeration, HID streaming) over a simple ioctl API. Mass
-storage and hub support are next on the roadmap.
+storage reads work (Bulk-Only Transport + SCSI + FAT, ring-3 over the
+VxD); a real drive letter and full hub support are the next steps.
 
 ## Why no driver ever existed: the card's CIS lies
 
@@ -132,9 +133,13 @@ for the full switch list.
 - [x] USB keyboard: ring-0 VKD_Force_Keys injection, HID→scan-code
       translation, report diffing, typematic synthesis (supervisor
       auto-detection of keyboard vs mouse still pending)
-- [ ] USB hubs (Apple keyboards etc. enumerate as hubs and need a hub
-      layer; also the road to mouse + keyboard simultaneously)
-- [ ] Bulk transfers + mass storage → drive letter
+- [x] USB mass storage: Bulk-Only Transport + SCSI, reads a USB stick's
+      sectors/partitions/FAT directory (CFUDISK, ring-3 over the VxD's
+      bulk-transaction ioctl — verified reading files off a FAT32 drive)
+- [~] USB hubs (hub descent implemented in CFUDISK: port power, reset,
+      downstream re-address — not yet tested; also the road to mouse +
+      keyboard at once)
+- [ ] Mass storage → real drive letter (needs an IOS-layer block driver)
 - [ ] Interrupt-driven operation (IRQ delivery is blocked by chipset IRQ
       routing on the test machine; INF LogConfig override experiment
       pending — everything currently runs polled and works)

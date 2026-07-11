@@ -71,17 +71,19 @@ int main(int argc, char **argv)
     static const unsigned char sa[8]   = {0x00,5,1,0,0,0,0,0};
     static const unsigned char sc[8]   = {0x00,9,1,0,0,0,0,0};
     static const unsigned char sp[8]   = {0x21,0x0B,0,0,0,0,0,0}; /* boot */
-    unsigned char d[16], mps, hs[4];
+    unsigned char d[16], mps, hs[5];
     unsigned char rbuf[4 + 32 * 9];
     unsigned got = 0, i, o;
     unsigned prevbtn = 0;
     unsigned long nrep = 0, nmove = 0;
-    int seconds = 60, ep = 1, speed;
+    int seconds = 60, ep = 1, speed, vmouse = 0, stop = 0;
     DWORD t0, st;
 
     for (i = 1; i < (unsigned)argc; i++) {
         if (!stricmp(argv[i], "/EP") && i + 1 < (unsigned)argc)
             ep = atoi(argv[++i]);
+        else if (!stricmp(argv[i], "/VMOUSE")) vmouse = 1;
+        else if (!stricmp(argv[i], "/STOP")) stop = 1;
         else seconds = atoi(argv[i]);
     }
     if (seconds <= 0) seconds = 60;
@@ -91,6 +93,13 @@ int main(int argc, char **argv)
     if (hVxd == INVALID_HANDLE_VALUE) {
         printf("cannot load CFU1.VXD (%lu)\n", GetLastError());
         return 1;
+    }
+
+    if (stop) {
+        vxd_ioctl(CFU_HIDSTOP, NULL, 0, NULL, 0);
+        printf("ring-0 pointer feed stopped.\n");
+        CloseHandle(hVxd);
+        return 0;
     }
 
     /* enumerate: probe speed, address 1, configured, boot protocol */
@@ -118,10 +127,19 @@ int main(int argc, char **argv)
     hs[1] = 1;                          /* device address */
     hs[2] = 8;                          /* mps            */
     hs[3] = 8;                          /* poll interval ms */
-    if (vxd_ioctl(CFU_HIDSTART, hs, 4, NULL, 0) != 0) {
+    hs[4] = (unsigned char)(vmouse ? 1 : 0);   /* mode: VMOUSE post */
+    if (vxd_ioctl(CFU_HIDSTART, hs, 5, NULL, 0) != 0) {
         printf("HIDSTART failed (%lu)\n", GetLastError());
         CloseHandle(hVxd);
         return 1;
+    }
+
+    if (vmouse) {
+        printf("ring-0 pointer feed is LIVE (VMOUSE injection in the VxD).\n"
+               "This program can exit - the mouse keeps working.\n"
+               "Stop it later with: CFUMOUSE /STOP\n");
+        CloseHandle(hVxd);
+        return 0;
     }
 
     printf("driving the pointer for %ds - move the USB mouse! (ESC stops)\n",

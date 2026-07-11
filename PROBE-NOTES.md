@@ -303,3 +303,32 @@ CFUMOUSE now uses kbhit/getch which both detects ESC and drains the queue.
 Remaining roadmap: mass storage (bulk + BOT + drive letter), IRQ
 LogConfig experiment, real VMD/VMOUSE integration (mouse_event is a demo
 vehicle; a proper mouse driver would feed VMOUSE at ring 0).
+
+## PROPER VMOUSE INTEGRATION — 2026-07-12
+
+**The pointer now runs entirely at ring 0.** VxD 1.40: CFU_HIDSTART takes
+an optional 5th byte (mode bit0 = VMOUSE). In that mode the HID tick
+parses each boot-protocol report and calls **VMD_Post_Pointer_Message**
+(VMOUSE device 0x0C, service 3): ESI = delta X (sign-extended),
+EDI = delta Y, AL = buttons in the serial-mouse format VMOUSE expects
+(bit5=L, bit4=R, bit3=M; HID bits translated via btntab). Calling
+convention lifted from the DDK's own serial mouse sample
+(SRC_MOUSE_SERMOU_SERIAL.ASM), which posts from its COM-port interrupt
+handler — same context class as our timeout tick. No VMD_Set_Mouse_Data
+registration was needed; posts are accepted and merged with the PS/2
+TrackPoint stream, and the HID->serial button remap comes out the right
+way round.
+
+DIOC_CLOSEHANDLE keeps the poll loop alive in VMOUSE mode, so
+`CFUMOUSE /VMOUSE` enumerates, arms the feed, and EXITS — the mouse
+keeps working with no process running (the VxD stays resident because
+CONFIGMG loaded it as the devnode's DevLoader). `CFUMOUSE /STOP` cancels
+(hid_stop also clears hid_mode so later mode-0 sessions clean up
+normally). Verified on the 235: feed survives app exit and DOS-window
+close; buttons correct; /STOP works.
+
+This is, in effect, a working USB mouse driver for Windows 98 via the
+REX-CFU1. Remaining gap to "true" driver polish: auto-enumerate + auto-
+start the feed from CONFIG_START at boot (today it needs one CFUMOUSE
+/VMOUSE run per session), and wheel support (needs the HID report
+descriptor or Logitech's 16-bit report format instead of boot protocol).

@@ -24,6 +24,7 @@
         include vwin32.inc
         include vpicd.inc
         include configmg.inc
+        include vmd.inc
 
 ;----------------------------------------------------------------------------
 ; ioctl codes (keep in sync with win/diag/CFU1.H)
@@ -45,11 +46,11 @@ CFU_USBINIT     equ 100Dh       ; in: BYTE lowspeed   out: DWORD INTSTAT
 CFU_XACT        equ 100Eh       ; in: CFU_XREQ        out: CFU_XRSP
 CFU_CTRL        equ 100Fh       ; in: CFU_CREQ        out: CFU_CRSP
 CFU_HIDSTART    equ 1010h       ; in: BYTE ep,devaddr,mps,interval_ms
+                                ;     [,BYTE mode: bit0 = post to VMOUSE]
 CFU_HIDSTOP     equ 1011h
 CFU_HIDREAD     equ 1012h       ; out: DWORD count + count*9 (len+8 data)
 
-VXD_VERSION     equ 00010301h   ; 1.31 - timer-driven HID poll loop
-                                ;   (1.31 fixes the timeout handle register)
+VXD_VERSION     equ 00010400h   ; 1.40 - ring-0 VMOUSE pointer integration
 
 HIDRING_SLOTS   equ 32
 HIDSLOT_SIZE    equ 9
@@ -154,10 +155,13 @@ hid_mps         db      0
 hid_ivl         db      10
 hid_tog         db      0
 hid_run         db      0               ; 1 = keep polling (gate reschedule)
-                db      2 dup (0)
+hid_mode        db      0               ; bit0 = post reports to VMOUSE
+                db      1 dup (0)
 hid_head        dd      0
 hid_tail        dd      0
 hidring         db      HIDRING_SLOTS*HIDSLOT_SIZE dup (0)
+; HID boot buttons (b0=L b1=R b2=M) -> VMOUSE serial format (20h/10h/08h)
+btntab          db      000h, 020h, 010h, 030h, 008h, 028h, 018h, 038h
 cmconfig        Config_Buff_s <>
 VxD_LOCKED_DATA_ENDS
 
@@ -456,7 +460,10 @@ BeginProc CFU1_Ioctl
 @@:     cmp     eax, DIOC_CLOSEHANDLE           ; -1: cleanup on CloseHandle
         jne     @F
         call    ioc_unhook
+        test    [hid_mode], 1           ; VMOUSE mode survives app exit -
+        jnz     close_keep              ; the pointer keeps working
         call    hid_stop
+close_keep:
         xor     eax, eax
         ret
 @@:
@@ -1163,7 +1170,12 @@ ioc_hidstart:
         jnz     @F
         mov     al, 10                  ; default 10ms
 @@:     mov     [hid_ivl], al
-        mov     [hid_tog], 0
+        mov     [hid_mode], 0
+        cmp     [esi.cbInBuffer], 5     ; optional 5th byte: mode
+        jb      @F
+        mov     al, [edx+4]
+        mov     [hid_mode], al
+@@:     mov     [hid_tog], 0
         mov     [hid_head], 0
         mov     [hid_tail], 0
         mov     [hid_run], 1
@@ -1184,6 +1196,7 @@ ioc_hidstop:
 
 BeginProc hid_stop
         mov     [hid_run], 0            ; stray in-flight tick won't re-arm
+        mov     [hid_mode], 0
         cmp     [hid_handle], 0
         jz      @F
         push    esi
@@ -1486,6 +1499,27 @@ BeginProc CFU1_HidTick, High_Freq
         mov     al, 10h
         call    buf_from_chip
         pop     edi
+
+        ; ring-0 pointer: hand a boot-protocol report straight to VMOUSE
+        test    [hid_mode], 1
+        jz      ht_nopost
+        cmp     byte ptr [edx], 3       ; need buttons+dx+dy at least
+        jb      ht_nopost
+        push    ebx
+        push    esi
+        push    edi
+        push    edx
+        movzx   ebx, byte ptr [edx+1]   ; HID buttons
+        and     ebx, 7
+        mov     al, [btntab+ebx]        ; AL = VMOUSE button format
+        movsx   esi, byte ptr [edx+2]   ; ESI = delta X
+        movsx   edi, byte ptr [edx+3]   ; EDI = delta Y
+        VxDCall VMD_Post_Pointer_Message
+        pop     edx
+        pop     edi
+        pop     esi
+        pop     ebx
+ht_nopost:
         mov     eax, [hid_head]
         inc     eax
         and     eax, HIDRING_SLOTS-1

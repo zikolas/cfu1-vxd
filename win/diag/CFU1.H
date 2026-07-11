@@ -25,6 +25,9 @@
 #define CFU_HIDREAD     0x1012  /* out: DWORD count + count*(1+8) bytes     */
 #define CFU_AUTOMOUSE   0x1013  /* in: BYTE 1=on/0=off (hot-plug supervisor)*/
 #define CFU_AUTOSTAT    0x1014  /* out: DWORD b0 run, b1 armed, b8.. state  */
+#define CFU_FORCEKEY    0x1015  /* in: raw scan bytes -> VKD_Force_Keys     */
+#define CFU_KBDSTART    0x1016  /* in: BYTE ep, devaddr, mps, interval_ms   */
+#define CFU_KBDSTAT     0x1017  /* out: 6 DWORDs pipeline counters (debug)  */
 
 #pragma pack(push, 1)
 typedef struct {

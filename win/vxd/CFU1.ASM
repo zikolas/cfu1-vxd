@@ -25,6 +25,7 @@
         include vpicd.inc
         include configmg.inc
         include vmd.inc
+        include vkd.inc
 
 ;----------------------------------------------------------------------------
 ; ioctl codes (keep in sync with win/diag/CFU1.H)
@@ -51,8 +52,11 @@ CFU_HIDSTOP     equ 1011h
 CFU_HIDREAD     equ 1012h       ; out: DWORD count + count*9 (len+8 data)
 CFU_AUTOMOUSE   equ 1013h       ; in: BYTE 1=on/0=off  (hot-plug supervisor)
 CFU_AUTOSTAT    equ 1014h       ; out: DWORD (b0 run, b1 armed, b8-15 state)
+CFU_FORCEKEY    equ 1015h       ; in: raw scan bytes -> VKD_Force_Keys (test)
+CFU_KBDSTART    equ 1016h       ; in: BYTE ep,devaddr,mps,interval_ms
+CFU_KBDSTAT     equ 1017h       ; out: 6 DWORDs (pipeline counters, debug)
 
-VXD_VERSION     equ 00010500h   ; 1.50 - hot-plug auto-mouse supervisor
+VXD_VERSION     equ 00010604h   ; 1.64 - keyboard feed survives app exit
 
 HIDRING_SLOTS   equ 32
 HIDSLOT_SIZE    equ 9
@@ -183,6 +187,56 @@ hid_tail        dd      0
 hidring         db      HIDRING_SLOTS*HIDSLOT_SIZE dup (0)
 ; HID boot buttons (b0=L b1=R b2=M) -> VMOUSE serial format (20h/10h/08h)
 btntab          db      000h, 020h, 010h, 030h, 008h, 028h, 018h, 038h
+
+;----------------------------------------------------------------------------
+; keyboard state (mode bit1)
+;----------------------------------------------------------------------------
+kb_prev         db      8 dup (0)       ; previous boot-keyboard report
+kb_held         db      0               ; HID usage of the repeating key
+kb_ticks        dd      0               ; ticks the key has been held
+; scan-code queue: tick (interrupt time) enqueues, a Schedule_Global_Event
+; callback drains it at task time (VKD_Force_Keys is not IRQ-time safe).
+kb_sbuf         db      128 dup (0)
+kb_sh           dd      0               ; producer index (free-running)
+kb_st           dd      0               ; consumer index
+kb_sched        db      0               ; a drain event is pending
+                db      3 dup (0)
+kb_batch        db      128 dup (0)     ; contiguous drain buffer for VKD
+; debug counters (CFU_KBDSTAT)
+kb_dbg_reports  dd      0               ; keyboard reports processed
+kb_dbg_enq      dd      0               ; scan bytes enqueued
+kb_dbg_sched    dd      0               ; drain events scheduled
+kb_dbg_drains   dd      0               ; drain callbacks fired
+kb_dbg_forced   dd      0               ; scan bytes handed to VKD_Force_Keys
+
+KB_DELAY        equ     60              ; typematic delay in ticks (~480ms)
+KB_RATE         equ     4               ; repeat interval in ticks (~32ms)
+
+; HID usage (keyboard page 07) -> PC scan code set 1.  Word entries:
+; low byte = make code, bit 15 set = E0-prefixed, 0 = unmapped.
+E0K             equ     8000h
+kscan   dw      0, 0, 0, 0                              ; 00-03
+        dw      1Eh,30h,2Eh,20h,12h,21h,22h,23h         ; 04-0B a-h
+        dw      17h,24h,25h,26h,32h,31h,18h,19h         ; 0C-13 i-p
+        dw      10h,13h,1Fh,14h,16h,2Fh,11h,2Dh         ; 14-1B q-x
+        dw      15h,2Ch                                 ; 1C-1D y,z
+        dw      02h,03h,04h,05h,06h,07h,08h,09h,0Ah,0Bh ; 1E-27 1-0
+        dw      1Ch,01h,0Eh,0Fh,39h                     ; 28-2C enter esc bs tab spc
+        dw      0Ch,0Dh,1Ah,1Bh,2Bh,2Bh                 ; 2D-32 - = [ ] \ #
+        dw      27h,28h,29h,33h,34h,35h,3Ah             ; 33-39 ; ' ` , . / caps
+        dw      3Bh,3Ch,3Dh,3Eh,3Fh,40h,41h,42h         ; 3A-41 F1-F8
+        dw      43h,44h,57h,58h                         ; 42-45 F9-F12
+        dw      37h+E0K,46h,0                           ; 46-48 prtsc scrlk pause(skip)
+        dw      52h+E0K,47h+E0K,49h+E0K                 ; 49-4B ins home pgup
+        dw      53h+E0K,4Fh+E0K,51h+E0K                 ; 4C-4E del end pgdn
+        dw      4Dh+E0K,4Bh+E0K,50h+E0K,48h+E0K         ; 4F-52 right left down up
+        dw      45h,35h+E0K,37h,4Ah,4Eh,1Ch+E0K         ; 53-58 numlk kp/ kp* kp- kp+ kpent
+        dw      4Fh,50h,51h,4Bh,4Ch,4Dh,47h,48h,49h     ; 59-61 kp1-kp9
+        dw      52h,53h,56h                             ; 62-64 kp0 kp. intl\
+KSCAN_MAX equ   ($ - kscan) / 2
+
+; HID modifier bits 0-7 -> scan codes (LCtrl LShift LAlt LGui RCtrl RShift RAlt RGui)
+kmod    dw      1Dh, 2Ah, 38h, 5Bh+E0K, 1Dh+E0K, 36h, 38h+E0K, 5Ch+E0K
 cmconfig        Config_Buff_s <>
 VxD_LOCKED_DATA_ENDS
 
@@ -486,8 +540,8 @@ BeginProc CFU1_Ioctl
 @@:     cmp     eax, DIOC_CLOSEHANDLE           ; -1: cleanup on CloseHandle
         jne     @F
         call    ioc_unhook
-        test    [hid_mode], 1           ; VMOUSE mode survives app exit -
-        jnz     close_keep              ; the pointer keeps working
+        cmp     [hid_mode], 0           ; any persistent feed (mouse OR
+        jne     close_keep              ; keyboard) survives app exit
         call    hid_stop
 close_keep:
         xor     eax, eax
@@ -535,6 +589,12 @@ close_keep:
         je      ioc_automouse
         cmp     eax, CFU_AUTOSTAT
         je      ioc_autostat
+        cmp     eax, CFU_FORCEKEY
+        je      ioc_forcekey
+        cmp     eax, CFU_KBDSTART
+        je      ioc_kbdstart
+        cmp     eax, CFU_KBDSTAT
+        je      ioc_kbdstat
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -1316,6 +1376,90 @@ ioc_autostat:
         or      al, 2
 @@:     jmp     ret_dword
 
+; CFU_FORCEKEY: bulk-inject the raw scan-code buffer via VKD_Force_Keys
+; (VKD self-test: ESI = buffer, ECX = count).
+ioc_forcekey:
+        call    sup_stop                ; keep the cursor still during the test
+        mov     ecx, [esi.lpvInBuffer]
+        test    ecx, ecx
+        jz      ioc_badbuf
+        mov     eax, [esi.cbInBuffer]
+        test    eax, eax
+        jz      fk_done
+        push    esi
+        push    edi
+        mov     esi, ecx                ; ESI = scan-code buffer
+        mov     ecx, eax                ; ECX = count
+        VxDCall  VKD_Force_Keys
+        pop     edi
+        pop     esi
+fk_done:
+        xor     eax, eax
+        ret
+
+; CFU_KBDSTART: arm the poll loop in keyboard mode (hid_mode bit1)
+ioc_kbdstart:
+        cmp     [enabled], 0
+        je      ioc_notena
+        call    sup_stop
+        cmp     [hid_handle], 0
+        jnz     ioc_badbuf
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbInBuffer], 4
+        jb      ioc_badbuf
+        mov     al, [edx]
+        mov     [hid_ep], al
+        mov     al, [edx+1]
+        mov     [hid_addr], al
+        mov     al, [edx+2]
+        mov     [hid_mps], al
+        mov     al, [edx+3]
+        test    al, al
+        jnz     @F
+        mov     al, 8
+@@:     mov     [hid_ivl], al
+        mov     [hid_mode], 2           ; keyboard
+        ; reset keyboard diff + scan-code queue state
+        xor     eax, eax
+        mov     dword ptr [kb_prev], eax
+        mov     dword ptr [kb_prev+4], eax
+        mov     [kb_held], al
+        mov     [kb_ticks], eax
+        mov     [kb_sh], eax
+        mov     [kb_st], eax
+        mov     [kb_sched], al
+        call    hid_arm
+        xor     eax, eax
+        ret
+
+; CFU_KBDSTAT: dump the keyboard pipeline counters for diagnosis
+ioc_kbdstat:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], 24
+        jb      ioc_badbuf
+        mov     eax, [kb_dbg_reports]
+        mov     [edx+0], eax
+        mov     eax, [kb_dbg_enq]
+        mov     [edx+4], eax
+        mov     eax, [kb_dbg_sched]
+        mov     [edx+8], eax
+        mov     eax, [kb_dbg_drains]
+        mov     [edx+12], eax
+        mov     eax, [kb_dbg_forced]
+        mov     [edx+16], eax
+        movzx   eax, [hid_mode]
+        mov     [edx+20], eax
+        mov     eax, [esi.lpcbBytesReturned]
+        test    eax, eax
+        jz      @F
+        mov     dword ptr [eax], 24
+@@:     xor     eax, eax
+        ret
+
 ioc_notena:
         mov     eax, CFUERR_NOTENAB
         ret
@@ -1881,16 +2025,17 @@ BeginProc CFU1_HidTick, High_Freq
         mov     [xa_budget], 3000       ; short budget at event time
         call    do_xact
         mov     [xa_budget], 50000
-        jc      ht_done                 ; timeout: leave toggle alone
+        jc      ht_noreport             ; timeout: no new report this tick
         test    al, 01h                 ; ACK?
-        jz      ht_done                 ; NAK/error: no data this tick
+        jz      ht_noreport             ; NAK/error: no data this tick
         xor     [hid_tog], 40h
         mov     al, 04h                 ; remaining
         call    sl_rd
         mov     ah, [hid_mps]
         sub     ah, al
         movzx   ecx, ah                 ; ECX = got
-        jecxz   ht_done
+        test    ecx, ecx
+        jz      ht_done
         cmp     ecx, 8
         jbe     @F
         mov     ecx, 8                  ; slot payload cap
@@ -1906,6 +2051,16 @@ BeginProc CFU1_HidTick, High_Freq
         call    buf_from_chip
         pop     edi
 
+        ; dispatch the report by mode
+        test    [hid_mode], 2           ; keyboard?
+        jz      ht_trymouse
+        push    edx
+        lea     esi, [edx+1]            ; report bytes
+        call    hid_kbd_report
+        call    kb_flush                ; schedule task-time injection
+        pop     edx
+        jmp     ht_nopost
+ht_trymouse:
         ; ring-0 pointer: hand a boot-protocol report straight to VMOUSE
         test    [hid_mode], 1
         jz      ht_nopost
@@ -1940,7 +2095,261 @@ ht_done:
         mov     [xbusy], 0
 ht_out:
         ret
+
+ht_noreport:                            ; NAK/timeout: no fresh report
+        test    [hid_mode], 2           ; keyboard typematic repeat
+        jz      ht_done
+        call    hid_kbd_idle
+        call    kb_flush
+        jmp     ht_done
 EndProc CFU1_HidTick
+
+;----------------------------------------------------------------------------
+; keyboard: HID boot report -> scan codes -> VKD_Force_Keys.
+; Helpers preserve EBX/ECX/EDX/ESI/EDI so caller loops stay intact.
+;----------------------------------------------------------------------------
+; kb_force: enqueue one raw scan byte (AL) for task-time injection.
+; The tick runs at interrupt time where VKD_Force_Keys is unsafe, so we
+; queue here and drain from a Schedule_Global_Event callback (kb_drain).
+BeginProc kb_force
+        push    eax
+        push    ebx
+        push    edx
+        mov     ebx, [kb_sh]
+        mov     edx, ebx
+        and     edx, 127
+        mov     [kb_sbuf + edx], al
+        inc     ebx
+        mov     [kb_sh], ebx
+        inc     dword ptr [kb_dbg_enq]
+        pop     edx
+        pop     ebx
+        pop     eax
+        ret
+EndProc kb_force
+
+; kb_flush: schedule a task-time drain if scan codes are queued
+BeginProc kb_flush
+        mov     eax, [kb_sh]
+        cmp     eax, [kb_st]
+        je      kf_done                 ; nothing queued
+        cmp     [kb_sched], 0
+        jne     kf_done                 ; drain already scheduled
+        mov     [kb_sched], 1
+        inc     dword ptr [kb_dbg_sched]
+        push    esi
+        push    edx
+        xor     edx, edx
+        mov     esi, OFFSET32 kb_drain
+        VMMCall Schedule_Global_Event
+        pop     edx
+        pop     esi
+kf_done:
+        ret
+EndProc kb_flush
+
+; kb_drain: task-time global-event callback; batch-inject the queue via VKD
+BeginProc kb_drain
+        push    ebx
+        push    ecx
+        push    edx
+        push    esi
+        push    edi
+        inc     dword ptr [kb_dbg_drains]
+        xor     edx, edx                ; batch length
+kd_loop:
+        mov     eax, [kb_st]
+        cmp     eax, [kb_sh]
+        je      kd_send
+        and     eax, 127
+        mov     cl, [kb_sbuf + eax]
+        mov     [kb_batch + edx], cl
+        inc     edx
+        inc     dword ptr [kb_st]
+        cmp     edx, 120
+        jb      kd_loop
+kd_send:
+        test    edx, edx
+        jz      kd_done
+        add     [kb_dbg_forced], edx
+        mov     esi, OFFSET32 kb_batch
+        mov     ecx, edx
+        VxDCall  VKD_Force_Keys
+kd_done:
+        mov     [kb_sched], 0
+        pop     edi
+        pop     esi
+        pop     edx
+        pop     ecx
+        pop     ebx
+        ret
+EndProc kb_drain
+
+; kb_key: emit a HID keyboard usage (AL) as make (AH=0) or break (AH=80h)
+BeginProc kb_key
+        push    ebx
+        push    edx
+        movzx   ebx, al
+        cmp     ebx, KSCAN_MAX
+        jae     kk_done
+        movzx   edx, word ptr [kscan + ebx*2]
+        test    dx, dx
+        jz      kk_done                 ; unmapped usage
+        test    dh, 80h                 ; E0-prefixed?
+        jz      @F
+        push    eax
+        mov     al, 0E0h
+        call    kb_force
+        pop     eax
+@@:     mov     al, dl                  ; make code
+        or      al, ah                  ; |80h for break
+        call    kb_force
+kk_done:
+        pop     edx
+        pop     ebx
+        ret
+EndProc kb_key
+
+; kb_mod: emit a modifier (AL = bit index 0-7) make (AH=0) / break (AH=80h)
+BeginProc kb_mod
+        push    ebx
+        push    edx
+        movzx   ebx, al
+        movzx   edx, word ptr [kmod + ebx*2]
+        test    dh, 80h
+        jz      @F
+        push    eax
+        mov     al, 0E0h
+        call    kb_force
+        pop     eax
+@@:     mov     al, dl
+        or      al, ah
+        call    kb_force
+        pop     edx
+        pop     ebx
+        ret
+EndProc kb_mod
+
+; kb_contains: is keycode AL present in the 6 keycodes at [EDI]?  ZF=1 if yes
+BeginProc kb_contains
+        push    ecx
+        push    edi
+        mov     ecx, 6
+        repne   scasb
+        pop     edi
+        pop     ecx
+        ret
+EndProc kb_contains
+
+;----------------------------------------------------------------------------
+; hid_kbd_report: ESI -> fresh 8-byte boot report.  Diff against kb_prev,
+; emit make/break for modifiers and keys, update the typematic target.
+;----------------------------------------------------------------------------
+BeginProc hid_kbd_report
+        push    ebx
+        push    ecx
+        push    edx
+        push    esi
+        push    edi
+        inc     dword ptr [kb_dbg_reports]
+
+        ; ---- modifiers (byte 0) ----
+        mov     cl, [esi]               ; new mod state (shifts down)
+        mov     ch, [kb_prev]           ; old mod state (shifts down)
+        mov     bl, cl
+        xor     bl, ch                  ; changed bits
+        xor     bh, bh                  ; bit index 0..7
+km_loop:
+        test    bl, 1
+        jz      km_next
+        mov     al, bh
+        xor     ah, ah                  ; assume make
+        test    cl, 1
+        jnz     @F
+        mov     ah, 80h                 ; now clear -> break
+@@:     call    kb_mod
+km_next:
+        shr     bl, 1
+        shr     cl, 1
+        inc     bh
+        cmp     bh, 8
+        jb      km_loop
+
+        ; ---- breaks: old keys no longer present ----
+        mov     ecx, 6                  ; index 2..7
+        mov     ebx, 2
+kb_brk:
+        mov     al, [kb_prev + ebx]
+        test    al, al
+        jz      kb_brk_next
+        lea     edi, [esi + 2]          ; new keycodes
+        call    kb_contains
+        jz      kb_brk_next             ; still down
+        mov     ah, 80h
+        call    kb_key                  ; break
+kb_brk_next:
+        inc     ebx
+        cmp     ebx, 8
+        jb      kb_brk
+
+        ; ---- makes: new keys not previously present; track last for repeat ----
+        mov     [kb_held], 0
+        mov     ebx, 2
+kb_mk:
+        mov     al, [esi + ebx]
+        test    al, al
+        jz      kb_mk_next
+        cmp     al, 4                   ; usage < 4 = error/rollover, skip
+        jb      kb_mk_next
+        mov     [kb_held], al           ; last valid key = repeat target
+        push    ebx
+        lea     edi, [kb_prev + 2]      ; old keycodes
+        call    kb_contains
+        pop     ebx
+        jz      kb_mk_next              ; was already down
+        xor     ah, ah
+        call    kb_key                  ; make
+kb_mk_next:
+        inc     ebx
+        cmp     ebx, 8
+        jb      kb_mk
+
+        mov     [kb_ticks], 0           ; restart typematic delay
+
+        ; ---- save report ----
+        mov     eax, [esi]
+        mov     dword ptr [kb_prev], eax
+        mov     eax, [esi + 4]
+        mov     dword ptr [kb_prev + 4], eax
+
+        pop     edi
+        pop     esi
+        pop     edx
+        pop     ecx
+        pop     ebx
+        ret
+EndProc hid_kbd_report
+
+;----------------------------------------------------------------------------
+; hid_kbd_idle: no fresh report; synthesize typematic repeat for a held key.
+;----------------------------------------------------------------------------
+BeginProc hid_kbd_idle
+        cmp     [kb_held], 0
+        jz      ki_done
+        mov     eax, [kb_ticks]
+        inc     eax
+        mov     [kb_ticks], eax
+        cmp     eax, KB_DELAY
+        jb      ki_done
+        sub     eax, KB_DELAY
+        test    eax, KB_RATE - 1        ; KB_RATE is a power of two
+        jnz     ki_done
+        mov     al, [kb_held]
+        xor     ah, ah
+        call    kb_key                  ; repeated make
+ki_done:
+        ret
+EndProc hid_kbd_idle
 
 ;----------------------------------------------------------------------------
 ; hardware interrupt handler: ack the SL811, count, EOI

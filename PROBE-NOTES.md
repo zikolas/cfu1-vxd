@@ -365,3 +365,39 @@ wheel byte position TBD - identify empirically with /HID while
 scrolling), add a report-protocol parse mode to the tick (post dx/dy/
 buttons; stash wheel in the ring), and a small resident helper
 (CFUWHEEL) that drains wheel deltas and emits mouse_event(WHEEL).
+
+## USB KEYBOARD — 2026-07-12
+
+**Working end to end** (VxD 1.64 + CFUKBD.EXE, tested with a Vortex
+(Holtek 04D9:0192) mechanical keyboard): boot-protocol reports at 1ms ->
+ring-0 poll (mode bit1) -> report state diffing (HID reports are
+snapshots; makes/breaks synthesized by comparing to kb_prev, modifiers
+bit-diffed) -> HID usage->scan code set 1 translation (kscan word table,
+bit15 = E0 prefix; kmod for the 8 modifier bits) -> scan-code queue ->
+Schedule_Global_Event -> VKD_Force_Keys at task time. Typematic repeat
+synthesized in the tick (KB_DELAY 60 ticks, KB_RATE 4). Feed persists
+after CFUKBD exits; CFUKBD /STOP ends it; /TEST = pure-VKD "hi"
+injection self-test; /KSTAT = pipeline counters.
+
+Debugging lessons (three strikes before it worked):
+1. **VKD_Force_Keys (plural service, 0x0D svc 7) takes ESI=scan buffer +
+   ECX=count.** The AL=scancode/ECX=repeat convention belongs to
+   VKD_API_Force_Key (the V86/PM API), not the service. First attempt
+   passed AL and injected nothing.
+2. **VKD_Force_Keys is not interrupt-time safe** (unlike
+   VMD_Post_Pointer_Message which mouse drivers call from IRQ handlers).
+   Calling it from the Set_Global_Time_Out tick did nothing. Fix: queue
+   scan bytes in the tick, drain via Schedule_Global_Event (VMM svc 0x0E)
+   at task time. /TEST worked all along because ioctls run at task time.
+3. **DIOC_CLOSEHANDLE was stopping the keyboard feed**: the survive-exit
+   test was `test hid_mode,1` (mouse only); keyboard mode=2 fell through
+   to hid_stop, so the poll died the instant CFUKBD exited — reports
+   counter 0 gave it away instantly once /KSTAT existed. Counters >>
+   guesswork; the instrumentation ioctl paid for itself in one run.
+
+Also learned: **Apple USB keyboards enumerate as a HUB** (VID 05AC class
+09, kbd behind an internal hub + passthrough ports) — unsupported until
+we build a hub layer. Devices with built-in USB ports will generally be
+hubs. Vortex/plain keyboards are direct HID (class 00 / iface 03-01-01).
+Caps-lock LED needs a SET_REPORT output report (not sent yet) — LED
+never lighting is NOT a failure indicator.

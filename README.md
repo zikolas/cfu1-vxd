@@ -16,10 +16,12 @@ Current state: **a working, installable USB mouse driver for Windows
 98.** Insert the card and Windows PnP-installs it (INF + CONFIGMG-
 integrated VxD, auto-enabled at boot); plug a USB mouse into the card at
 any time and a ring-0 hot-plug supervisor enumerates it and feeds
-Windows' pointer via VMOUSE — no commands, hot-unplug/replug safe. The
+Windows' pointer via VMOUSE — no commands, hot-unplug/replug safe. USB
+keyboards work too (one CFUKBD command arms a ring-0 feed that types
+into Windows via VKD, with typematic repeat). The
 same VxD exposes a full polled USB transfer engine (control + interrupt
 transfers, enumeration, HID streaming) over a simple ioctl API. Mass
-storage and keyboard support are next on the roadmap.
+storage and hub support are next on the roadmap.
 
 ## Why no driver ever existed: the card's CIS lies
 
@@ -127,12 +129,33 @@ for the full switch list.
       unplug/replug safe
 - [ ] Mouse wheel (report-protocol parse + ring-3 helper; Win98's VMOUSE
       service has no Z axis)
-- [ ] USB keyboard (VKD_Force_Keys injection, HID→scan-code table, report
-      diffing, typematic synthesis, supervisor device-type detection)
+- [x] USB keyboard: ring-0 VKD_Force_Keys injection, HID→scan-code
+      translation, report diffing, typematic synthesis (supervisor
+      auto-detection of keyboard vs mouse still pending)
+- [ ] USB hubs (Apple keyboards etc. enumerate as hubs and need a hub
+      layer; also the road to mouse + keyboard simultaneously)
 - [ ] Bulk transfers + mass storage → drive letter
 - [ ] Interrupt-driven operation (IRQ delivery is blocked by chipset IRQ
       routing on the test machine; INF LogConfig override experiment
       pending — everything currently runs polled and works)
+
+### On not using Microsoft's USB stack
+
+Windows 98 *does* have a full WDM USB stack (`USBD.SYS`, `USBHUB.SYS`,
+the HID class drivers), and its HID input shims feed the very same
+VMOUSE/VKD services this driver injects into. We can't ride it: the whole
+stack sits on top of a host-controller driver (`OPENHCI.SYS` /
+`UHCD.SYS`) bound to `USBD.SYS` through the undocumented, internal HCDI
+interface, and there is no SL811 HCD nor a documented way to write one.
+Period third-party USB stacks for 9x (e.g. OrangeWare's) shipped
+parallel to Microsoft's for the same reason. So this driver is its own
+small USB stack by necessity, not preference.
+
+- [ ] **(research)** WDM HCD for the SL811: reverse the HCDI so the card
+      plugs into Microsoft's own USB/HID/USBSTOR stack — would make hubs,
+      device coexistence, and mass storage "free", but it's a hard RE
+      project with real risk. The pragmatic hub + mass-storage work above
+      reaches the same user-visible goals without it.
 
 ## References
 

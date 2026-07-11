@@ -22,6 +22,27 @@ int main(int argc, char **argv)
     h = CreateFile(path, 0, 0, NULL, 0, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) { printf("no CFU1.VXD (%lu)\n", GetLastError()); return 1; }
 
+    if (argv[1][0] == 'T' || argv[1][0] == 't') {     /* IOR trace ring */
+        static DWORD t[129];
+        int n, first, k;
+        memset(t, 0, sizeof t);
+        if (!DeviceIoControl(h, CFU_IORTRACE, NULL, 0, t, sizeof t, &r, NULL))
+            printf("IORTRACE failed (%lu)\n", GetLastError());
+        else {
+            printf("%lu IORs total; ring (oldest first):\n", t[0]);
+            n = (t[0] > 32) ? 32 : (int)t[0];
+            first = (int)(t[0] % 32);   /* next write slot = oldest */
+            for (k = 0; k < n; k++) {
+                int i2 = (t[0] > 32) ? (first + k) % 32 : k;
+                DWORD *e = &t[1 + i2 * 4];
+                printf("  func=%02lX flags=%08lX lba=%9lu cnt=%4lu%s\n",
+                       e[0], e[1], e[2], e[3],
+                       (e[1] & 0x80000UL) ? "  LOG" : "");
+            }
+        }
+        CloseHandle(h);
+        return 0;
+    }
     if (argv[1][0] == 'E' || argv[1][0] == 'e') {     /* enumerate DCBs */
         DWORD e[16];
         memset(e, 0, sizeof e);

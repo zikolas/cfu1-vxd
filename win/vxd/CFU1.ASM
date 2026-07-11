@@ -90,8 +90,9 @@ CFU_VOLDOWN     equ 1023h       ; polite teardown; in: BYTE force (skip the
                                 ; query-remove veto); out: DWORD 0 ok/1 veto
 CFU_VOLSTAT     equ 1024h       ; out: mounted, log_dcb, part_start,
                                 ;      part_len, drive_index
+CFU_IORTRACE    equ 1025h       ; out: DWORD total + 32*(func,flags,lba,cnt)
 
-VXD_VERSION     equ 00020004h   ; 2.04 - we translate logical LBAs again
+VXD_VERSION     equ 00020005h   ; 2.05 - IOR trace ring (evidence!)
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -659,6 +660,8 @@ close_keep:
         je      ioc_voldown
         cmp     eax, CFU_VOLSTAT
         je      ioc_volstat
+        cmp     eax, CFU_IORTRACE
+        je      ioc_iortrace
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -2156,6 +2159,31 @@ sd_done:
         ret
 EndProc sched_voldown
 
+; CFU_IORTRACE: dump the request trace ring
+ioc_iortrace:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], 516  ; total + 32*16
+        jb      ioc_badbuf
+        mov     eax, [iortr_idx]
+        mov     [edx+0], eax
+        push    esi
+        push    edi
+        cld
+        mov     esi, OFFSET32 iortr_ring
+        lea     edi, [edx+4]
+        mov     ecx, 128
+        rep     movsd
+        pop     edi
+        pop     esi
+        mov     ecx, [esi.lpcbBytesReturned]
+        test    ecx, ecx
+        jz      @F
+        mov     dword ptr [ecx], 516
+@@:     xor     eax, eax
+        ret
+
 ; CFU_MSCMOUNT: enumerate + read capacity in ring 0; out: blocks, block_size
 ioc_mscmount:
         cmp     [enabled], 0
@@ -2506,6 +2534,8 @@ sup_class       db      0               ; classified device class (03/08)
                 db      1 dup (0)
 vol_secbuf      db      512 dup (0)     ; MBR parse buffer
 ior_counts      dd      48 dup (0)      ; per-IOR_func counters (0..2Fh)
+iortr_idx       dd      0               ; trace ring write index
+iortr_ring      dd      128 dup (0)     ; 32 x (func, flags, lba, count)
 CFU_DDB_SIZE    equ     32              ; = size DDB (header only)
 VxD_LOCKED_DATA_ENDS
 
@@ -2688,6 +2718,18 @@ BeginProc CFU1_IosReq
         jae     @F
         inc     dword ptr [ior_counts + eax*4]
 @@:
+        mov     ecx, [iortr_idx]        ; trace ring: func, flags, lba, cnt
+        and     ecx, 31
+        shl     ecx, 4
+        mov     [iortr_ring + ecx], eax
+        mov     eax, [ebx + IOP_ior + IOR_flags]
+        mov     [iortr_ring + ecx + 4], eax
+        mov     eax, [ebx + IOP_ior + IOR_start_addr]
+        mov     [iortr_ring + ecx + 8], eax
+        mov     eax, [ebx + IOP_ior + IOR_xfer_count]
+        mov     [iortr_ring + ecx + 12], eax
+        inc     dword ptr [iortr_idx]
+        movzx   eax, word ptr [ebx + IOP_ior + IOR_func]
         cmp     eax, 0                  ; IOR_READ
         je      req_read
         cmp     eax, 1                  ; IOR_WRITE

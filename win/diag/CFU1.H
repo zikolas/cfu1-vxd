@@ -46,6 +46,7 @@
                                    out: 0 ok, 1 vetoed, 2 no volume         */
 #define CFU_VOLSTAT     0x1024  /* out: mounted, log_dcb, part_start,
                                    part_len, drive_index (5 DWORDs)         */
+#define CFU_IORTRACE    0x1025  /* out: DWORD total + 32*(func,flags,lba,n) */
 
 #pragma pack(push, 1)
 typedef struct {

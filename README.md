@@ -19,8 +19,8 @@ plug a USB mouse into the card at any time and a ring-0 hot-plug
 supervisor enumerates it and feeds Windows' pointer via VMOUSE — no
 commands, hot-unplug/replug safe. USB keyboards work too (one CFUKBD
 command arms a ring-0 feed that types into Windows via VKD, with
-typematic repeat). Plug in a USB stick and one `CFUDRV` command mounts
-it as a real drive letter — `DIR E:`, Explorer, reading *and writing*,
+typematic repeat). Plug in a USB stick and the supervisor classifies it
+and auto-mounts it as a real removable drive letter at boot or hot-insert — `DIR E:`, Explorer, reading *and writing*,
 all through the card (the VxD registers with Windows' I/O Supervisor as
 a port driver and acts as its own TSD; see below). The same VxD exposes
 a full polled USB transfer engine (control + interrupt + bulk) over a
@@ -34,12 +34,14 @@ simple ioctl API.
 > contents you would mind losing.** Strictly testing and fun only.
 > Specifically:
 >
-> * There is **no graceful unplug yet**. Windows may hold cached writes;
->   yanking the stick (or the card) while the volume is mounted can
->   corrupt the stick's filesystem. Shut down before removing.
-> * The volume is currently presented as a fixed disk, so VFAT may
->   write-behind cache (making surprise removal *more* dangerous, not
->   less).
+> * **KNOWN BUG (under debug): file DATA round-trips corrupt** on the
+>   current build - directory listings and file creation work, but file
+>   contents read back wrong (an LBA-translation asymmetry between
+>   metadata and data requests; an IOR trace harness is the next step).
+>   A test stick has already been wiped by an earlier form of this bug.
+> * The volume is presented removable/write-through and there is a
+>   CFUEJECT tool, but the unplug/eject/replug lifecycle is still being
+>   stabilised on real hardware (blue screens were involved).
 > * A wrong turn in the IOS layer can hang the whole storage stack —
 >   during development one experiment required a hard reset and assigned
 >   phantom drive letters A: through Z:. That path is gone, but treat
@@ -213,11 +215,19 @@ CPEEK E              enumerate all of IOS's DCBs
       driver *and* its own TSD — mounts a USB stick as a read/write
       Windows drive letter (verified: DIR, TYPE, file creation through
       VFAT on a 16 GB FAT32 stick)
-- [ ] Auto-arm the drive letter at boot (no CFUDRV run needed)
-- [ ] Graceful unplug/eject: present as removable (write-through cache),
-      detach detection → fail I/O fast → `ISP_DCB_DESTROY` teardown
-      (flushes + waits for pending I/O per the DDK), CFUEJECT flush
-      command, remount on replug
+- [x] Auto-arm at boot / hot-insert: the supervisor classifies the
+      attached device (config descriptor) and brings the volume up at
+      appy time - no commands needed
+- [~] Removable-drive lifecycle (WIP, unstable): removable/write-through
+      presentation, detach → fast-fail → `ISP_DCB_DESTROY` teardown,
+      CFUEJECT (+ /UP remount) - **blocked on an LBA-translation bug
+      that corrupts file data** (metadata vs data requests are
+      translated differently; next step is an IOR trace ring to derive
+      the policy from evidence)
+- [ ] Interrupt-driven transfer engine: IRQ7 is now free on the test
+      machine (LPT1 disabled); this replaces the synchronous ring-0 PIO
+      that freezes the UI during copies (currently mitigated by a 4KB
+      transfer cap)
 - [ ] Interrupt-driven operation (IRQ delivery is blocked by chipset IRQ
       routing on the test machine; INF LogConfig override experiment
       pending — everything currently runs polled and works)
@@ -232,7 +242,8 @@ stack sits on top of a host-controller driver (`OPENHCI.SYS` /
 interface, and there is no SL811 HCD nor a documented way to write one.
 Period third-party USB stacks for 9x (e.g. OrangeWare's) shipped
 parallel to Microsoft's for the same reason. So this driver is its own
-small USB stack by necessity, not preference.
+small USB stack by necessity, not preference. The full analysis is in
+[docs/why-not-the-windows-usb-stack.pdf](docs/why-not-the-windows-usb-stack.pdf).
 
 - [ ] **(research)** WDM HCD for the SL811: reverse the HCDI so the card
       plugs into Microsoft's own USB/HID/USBSTOR stack — would make hubs,

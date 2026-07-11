@@ -91,7 +91,7 @@ CFU_VOLDOWN     equ 1023h       ; polite teardown; in: BYTE force (skip the
 CFU_VOLSTAT     equ 1024h       ; out: mounted, log_dcb, part_start,
                                 ;      part_len, drive_index
 
-VXD_VERSION     equ 00020003h   ; 2.03 - own calldown node per logical DCB
+VXD_VERSION     equ 00020004h   ; 2.04 - we translate logical LBAs again
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -2724,12 +2724,13 @@ req_read:
         cmp     byte ptr [msc_mounted], 0
         je      req_nomedia
         mov     byte ptr [xbusy], 1
-        mov     eax, [ebx + IOP_ior + IOR_start_addr]   ; physical LBA -
-        ; IOS's own calldown layer translates volume-relative addresses
-        ; (IORF_LOGICAL_START_SECTOR) using DCB_Partition_Start BEFORE the
-        ; request reaches us; adding part_start here double-offsets and
-        ; reads garbage (2.00 regression, proven by a corrupt DIR).
-        mov     ecx, [ebx + IOP_ior + IOR_xfer_count]   ; sector count
+        mov     eax, [ebx + IOP_ior + IOR_start_addr]
+        ; since 2.03 the logical DCB has its OWN calldown chain (no IOS
+        ; translator entry), so WE translate volume-relative LBAs now
+        test    dword ptr [ebx + IOP_ior + IOR_flags], 80000h
+        jz      @F
+        add     eax, [part_start]
+@@:     mov     ecx, [ebx + IOP_ior + IOR_xfer_count]   ; sector count
         mov     edi, [ebx + IOP_ior + IOR_buffer_ptr]   ; dest buffer
         push    ebx                     ; BOT engine trashes EBX (IOP ptr)
         call    msc_do_read
@@ -2741,9 +2742,12 @@ req_write:
         cmp     byte ptr [msc_mounted], 0
         je      req_nomedia
         mov     byte ptr [xbusy], 1
-        mov     eax, [ebx + IOP_ior + IOR_start_addr]   ; physical LBA
-        mov     ecx, [ebx + IOP_ior + IOR_xfer_count]   ; (see read path -
-        mov     esi, [ebx + IOP_ior + IOR_buffer_ptr]   ; IOS pre-translates)
+        mov     eax, [ebx + IOP_ior + IOR_start_addr]
+        test    dword ptr [ebx + IOP_ior + IOR_flags], 80000h
+        jz      @F                      ; we are the translator now (2.04)
+        add     eax, [part_start]
+@@:     mov     ecx, [ebx + IOP_ior + IOR_xfer_count]
+        mov     esi, [ebx + IOP_ior + IOR_buffer_ptr]
         push    ebx                     ; BOT engine trashes EBX (IOP ptr)
         call    msc_do_write
         pop     ebx

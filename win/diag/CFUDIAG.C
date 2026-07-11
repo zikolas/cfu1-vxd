@@ -380,6 +380,130 @@ static void usb_enum(void)
     printf("enum failed at both speeds; INTSTAT=%02X\n", slr(SL_INTSTAT));
 }
 
+/*--------------------------- ring-0 engine: enumeration + HID demo -------*/
+static int ctrl_xfer(unsigned char addr, unsigned char mps,
+                     const unsigned char *setup, void *out, unsigned wlen,
+                     unsigned *got)
+{
+    CFU_CREQ q;
+    static CFU_CRSP r;
+    memset(&q, 0, sizeof q);
+    q.devaddr = addr;
+    q.mps = mps;
+    q.wlen = (unsigned short)wlen;
+    memcpy(q.setup, setup, 8);
+    memset(&r, 0, sizeof r);
+    if (vxd_ioctl(CFU_CTRL, &q, sizeof q, &r, sizeof r) != 0) {
+        printf("  CFU_CTRL ioctl failed (%lu)\n", GetLastError());
+        return 0;
+    }
+    if (r.err) {
+        static const char *st[] = { "?", "SETUP", "DATA", "STATUS" };
+        printf("  control transfer failed at %s (SL811 status %02lX)\n",
+               st[r.err & 3], (r.err >> 8) & 0xFF);
+        return 0;
+    }
+    if (got) *got = r.got;
+    if (out && r.got) memcpy(out, r.data, r.got > wlen ? wlen : r.got);
+    return 1;
+}
+
+static int usb_init_ring0(int lowspeed)
+{
+    unsigned char ls = (unsigned char)lowspeed;
+    DWORD st = 0;
+    if (vxd_ioctl(CFU_USBINIT, &ls, 1, &st, 4) != 0) return -1;
+    return (int)st;
+}
+
+static void usb_enum2(void)
+{
+    static const unsigned char gd_dev[8] = {0x80,6,0,1,0,0,18,0};
+    static const unsigned char gd_dev8[8] = {0x80,6,0,1,0,0,8,0};
+    static const unsigned char gd_cfg9[8] = {0x80,6,0,2,0,0,9,0};
+    unsigned char sa[8] = {0x00,5,1,0,0,0,0,0};      /* SET_ADDRESS 1 */
+    unsigned char sc[8] = {0x00,9,1,0,0,0,0,0};      /* SET_CONFIGURATION 1 */
+    unsigned char gd_cfg[8] = {0x80,6,0,2,0,0,0,0};
+    unsigned char d[256], mps = 8;
+    unsigned got = 0, total, i;
+    int speed, st;
+
+    for (speed = 0; speed < 2; speed++) {
+        printf("enum2: bus reset, %s-speed host init...\n",
+               speed ? "LOW" : "FULL");
+        st = usb_init_ring0(speed);
+        printf("  INTSTAT after init: %02X\n", st);
+        if (!ctrl_xfer(0, 8, gd_dev8, d, 8, &got)) continue;
+        break;
+    }
+    if (speed == 2) { printf("enum2: no response at either speed\n"); return; }
+    mps = d[7] ? d[7] : 8;
+    printf("  ep0 max packet: %u\n", mps);
+
+    if (!ctrl_xfer(0, mps, sa, NULL, 0, NULL)) return;
+    Sleep(20);
+    printf("  SET_ADDRESS 1: ok\n");
+
+    if (!ctrl_xfer(1, mps, gd_dev, d, 18, &got)) return;
+    printf("  device descriptor (%u):", got);
+    for (i = 0; i < got && i < 18; i++) printf(" %02X", d[i]);
+    printf("\n");
+    if (got >= 14)
+        printf("  >>> VID=%02X%02X PID=%02X%02X bcdDevice=%02X.%02X usb=%X.%02X class=%02X\n",
+               d[9], d[8], d[11], d[10], d[13], d[12], d[3], d[2], d[4]);
+
+    if (!ctrl_xfer(1, mps, gd_cfg9, d, 9, &got) || got < 9) return;
+    total = d[2] | (d[3] << 8);
+    if (total > sizeof d) total = sizeof d;
+    printf("  config descriptor: wTotalLength=%u, %u interface(s)\n",
+           total, d[4]);
+    gd_cfg[6] = (unsigned char)total;
+    gd_cfg[7] = (unsigned char)(total >> 8);
+    if (!ctrl_xfer(1, mps, gd_cfg, d, total, &got)) return;
+    for (i = 0; i + 1 < got; i += d[i]) {
+        if (d[i] == 0) break;
+        if (d[i + 1] == 4)              /* interface descriptor */
+            printf("  interface %u: class %02X subclass %02X proto %02X%s\n",
+                   d[i + 2], d[i + 5], d[i + 6], d[i + 7],
+                   d[i + 5] == 3 ? "  <-- HID" : "");
+        if (d[i + 1] == 5)              /* endpoint descriptor */
+            printf("  endpoint %02X: attr %02X mps %u interval %ums\n",
+                   d[i + 2], d[i + 3], d[i + 4] | (d[i + 5] << 8), d[i + 6]);
+    }
+
+    if (!ctrl_xfer(1, mps, sc, NULL, 0, NULL)) return;
+    printf("  SET_CONFIGURATION 1: ok\n");
+    printf("*** FULL ENUMERATION COMPLETE (device at address 1, configured) ***\n");
+}
+
+/* poll a HID interrupt-IN endpoint and print reports as they arrive */
+static void hid_poll(int ep, int seconds)
+{
+    CFU_XREQ q;
+    static CFU_XRSP r;
+    DWORD t0 = GetTickCount(), n = 0;
+    unsigned toggle = 0, i;
+    printf("polling interrupt IN ep %d for %ds (move the mouse / press keys!)...\n",
+           ep, seconds);
+    while (GetTickCount() - t0 < (DWORD)seconds * 1000) {
+        memset(&q, 0, sizeof q);
+        q.pidep = (unsigned char)(0x90 | (ep & 0x0F));
+        q.devaddr = 1;
+        q.ctl = (unsigned char)(0x03 | (toggle ? 0x40 : 0));
+        q.len = 8;
+        memset(&r, 0, sizeof r);
+        if (vxd_ioctl(CFU_XACT, &q, sizeof q, &r, sizeof r) != 0) break;
+        if (r.status != 0xFFFFFFFFUL && (r.status & 1) && r.got) {
+            printf("  report %3lu:", ++n);
+            for (i = 0; i < r.got; i++) printf(" %02X", r.data[i]);
+            printf("\n");
+            toggle ^= 1;
+        }
+        Sleep(10);
+    }
+    printf("%lu report(s) in %ds\n", n, seconds);
+}
+
 static unsigned char pcic_peek(unsigned char reg)
 {
     DWORD v = 0;
@@ -568,7 +692,7 @@ static HANDLE load_vxd(void)
 
 int main(int argc, char **argv)
 {
-    int i, dosof = 0, swap = 0, dodet = 0, dooff = 0, irq = -1, dodump = 0, doenum = 0, doconf = 0, pnp_up = 0, rdreg_arg = -1, wrreg_arg = -1, wrval_arg = 0;
+    int i, dosof = 0, swap = 0, dodet = 0, dooff = 0, irq = -1, dodump = 0, doenum = 0, doconf = 0, pnp_up = 0, rdreg_arg = -1, wrreg_arg = -1, wrval_arg = 0, doenum2 = 0, hidep = -1;
     DWORD ver = 0;
 
     for (i = 1; i < argc; i++) {
@@ -581,6 +705,8 @@ int main(int argc, char **argv)
         else if (!stricmp(argv[i], "/LIVE")) { list_live_devnodes(); return 0; }
         else if (!stricmp(argv[i], "/PCIC")) dodump = 1;
         else if (!stricmp(argv[i], "/ENUM")) doenum = 1;
+        else if (!stricmp(argv[i], "/ENUM2")) doenum2 = 1;
+        else if (!stricmp(argv[i], "/HID") && i + 1 < argc) hidep = atoi(argv[++i]);
         else if (!stricmp(argv[i], "/CONF")) doconf = 1;
         else if (!stricmp(argv[i], "/RD") && i + 1 < argc) { rdreg_arg = (int)strtoul(argv[++i], NULL, 16); }
         else if (!stricmp(argv[i], "/WR") && i + 2 < argc) { wrreg_arg = (int)strtoul(argv[++i], NULL, 16); wrval_arg = (int)strtoul(argv[++i], NULL, 16); }
@@ -618,7 +744,7 @@ int main(int argc, char **argv)
     if (doconf && !raw) {
         pnp_up = show_conf();
         /* /CONF alone inspects PnP state without touching the hardware */
-        if (!(dosof || swap || dodet || doenum || dodump || dooff || irq >= 0)) {
+        if (!(dosof || swap || dodet || doenum || doenum2 || hidep >= 0 || dodump || dooff || irq >= 0)) {
             CloseHandle(hVxd);
             return 0;
         }
@@ -636,7 +762,7 @@ int main(int argc, char **argv)
 
     /* quick register peek/poke path: /WR reg val and/or /RD reg, then out */
     if ((wrreg_arg >= 0 || rdreg_arg >= 0) &&
-        !(dosof || swap || dodet || doenum || dodump || irq >= 0)) {
+        !(dosof || swap || dodet || doenum || doenum2 || hidep >= 0 || dodump || irq >= 0)) {
         if (wrreg_arg >= 0) {
             slw((unsigned char)wrreg_arg, (unsigned char)wrval_arg);
             printf("wr [%02X] = %02X\n", wrreg_arg, wrval_arg);
@@ -655,6 +781,9 @@ int main(int argc, char **argv)
     if (dodump) pcic_dump();
     if (dodet) detect();
     if (doenum) { usb_enum(); slw(SL_INTENA, 0); slw(SL_INTSTAT, 0xFF); }
+    if (doenum2) { usb_enum2(); }
+    if (hidep >= 0) { hid_poll(hidep, 8); }
+    if (doenum2 || hidep >= 0) { slw(SL_INTENA, 0); slw(SL_INTSTAT, 0xFF); }
     if (dosof || swap) { start_sof(swap); linestate("sof"); }
     if (irq >= 0) { if (!(dosof || swap)) start_sof(swap); irqtest(irq); }
     if (wrreg_arg >= 0) {

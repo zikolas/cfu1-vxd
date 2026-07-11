@@ -41,8 +41,35 @@ CFU_IRQUNHOOK   equ 1009h
 CFU_PCICRD      equ 100Ah       ; in: BYTE reg (socket bank added) out: DWORD
 CFU_PCICWR      equ 100Bh       ; in: BYTE reg, BYTE val
 CFU_GETCONF     equ 100Ch       ; out: CFU_CONF (PnP-assigned resources)
+CFU_USBINIT     equ 100Dh       ; in: BYTE lowspeed   out: DWORD INTSTAT
+CFU_XACT        equ 100Eh       ; in: CFU_XREQ        out: CFU_XRSP
+CFU_CTRL        equ 100Fh       ; in: CFU_CREQ        out: CFU_CRSP
 
-VXD_VERSION     equ 00010100h   ; 1.10 - PnP/CONFIGMG integration
+VXD_VERSION     equ 00010200h   ; 1.20 - ring-0 USB transfer engine
+
+; CFU_XREQ offsets (one raw transaction on EP A)
+XQ_PIDEP        equ 0           ; BYTE  PID<<4 | endpoint
+XQ_DEVADDR      equ 1           ; BYTE
+XQ_CTL          equ 2           ; BYTE  EP A host control bits
+XQ_LEN          equ 3           ; BYTE  transfer length (<= 120)
+XQ_DATA         equ 4           ; BYTE[len] for OUT/SETUP payloads
+; CFU_XRSP offsets
+XR_STATUS       equ 0           ; DWORD SL811 packet status (FFFFFFFF timeout)
+XR_GOT          equ 4           ; DWORD bytes received (IN)
+XR_DATA         equ 8           ; BYTE[got]
+
+; CFU_CREQ offsets (complete control transfer)
+CQ_DEVADDR      equ 0           ; BYTE
+CQ_MPS          equ 1           ; BYTE  max packet size of ep0 (8..64)
+CQ_WLEN         equ 2           ; WORD  data stage length
+CQ_SETUP        equ 4           ; BYTE[8] the SETUP packet
+CFU_CREQ_SIZE   equ 12
+; CFU_CRSP offsets
+CR2_ERR         equ 0           ; DWORD 0 ok; low byte stage 1/2/3,
+                                ;       byte1 = SL811 status (FF timeout)
+CR2_GOT         equ 4           ; DWORD data-stage bytes transferred
+CR2_DATA        equ 8           ; BYTE[wlen] for IN transfers
+CFU_CRSP_HDR    equ 8
 
 ; CFU_CONF output structure offsets
 CC_IOBASE       equ 0           ; WORD  Windows-assigned I/O base (0 = none)
@@ -103,6 +130,12 @@ pnp_flags       db      0               ; bit0 devnode, bit1 started, bit2 COR
 pnp_corrb       db      0
                 dw      0
 savregs         db      8 dup (0)       ; cor_fix PCIC reg save area
+xa_pidep        db      0               ; do_xact arguments
+xa_addr         db      0
+xa_ctl          db      0
+xa_len          db      0
+ct_toggle       db      0               ; control-transfer data toggle
+                db      3 dup (0)
 cmconfig        Config_Buff_s <>
 VxD_LOCKED_DATA_ENDS
 
@@ -429,6 +462,12 @@ BeginProc CFU1_Ioctl
         je      ioc_pcicwr
         cmp     eax, CFU_GETCONF
         je      ioc_getconf
+        cmp     eax, CFU_USBINIT
+        je      ioc_usbinit
+        cmp     eax, CFU_XACT
+        je      ioc_xact
+        cmp     eax, CFU_CTRL
+        je      ioc_ctrl
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -770,6 +809,301 @@ ioc_pcicwr:
         xor     eax, eax
         ret
 
+;----------------------------------------------------------------------------
+; CFU_USBINIT: bus reset (SE0 ~30ms) -> host mode (DSWAP+LSPD if lowspeed)
+; -> SOF counters + kickstart -> INTENA SOF-timer gate.  Returns INTSTAT.
+;----------------------------------------------------------------------------
+ioc_usbinit:
+        cmp     [enabled], 0
+        je      ioc_notena
+        mov     edx, [esi.lpvInBuffer]
+        xor     ecx, ecx                ; CL = lowspeed flag
+        test    edx, edx
+        jz      @F
+        mov     cl, [edx]
+@@:
+        mov     al, 06h                 ; INTENA off
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 05h                 ; CTL1: force SE0 (USB reset)
+        mov     ah, 08h
+        call    sl_wr
+        push    ecx
+        mov     ecx, 30000              ; ~30ms
+        call    iodelay
+        pop     ecx
+        mov     al, 05h
+        mov     ah, 00h
+        call    sl_wr
+        push    ecx
+        mov     ecx, 3000
+        call    iodelay
+        pop     ecx
+        mov     al, 0Eh                 ; SOF counter low
+        mov     ah, 0E0h
+        call    sl_wr
+        mov     ah, 0AEh                ; CTL2: HOST | SOF-high
+        test    cl, cl
+        jz      @F
+        or      ah, 40h                 ; + DSWAP for low speed
+@@:     mov     al, 0Fh
+        call    sl_wr
+        mov     al, 02h                 ; SOF kickstart: EP A len 0
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 03h                 ; PID=SOF ep0
+        mov     ah, 50h
+        call    sl_wr
+        mov     al, 04h
+        mov     ah, 00h
+        call    sl_wr
+        mov     al, 00h                 ; ARM
+        mov     ah, 01h
+        call    sl_wr
+        mov     ah, 01h                 ; CTL1: SOF_ENA (+LSPD if LS)
+        test    cl, cl
+        jz      @F
+        or      ah, 20h
+@@:     mov     al, 05h
+        call    sl_wr
+        mov     al, 0Dh
+        mov     ah, 0FFh
+        call    sl_wr
+        mov     al, 06h                 ; INTENA bit4 gates the SOF timer
+        mov     ah, 10h
+        call    sl_wr
+        mov     ecx, 100000             ; ~100ms post-reset recovery
+        call    iodelay
+        mov     al, 0Dh
+        call    sl_rd
+        movzx   eax, al
+        jmp     ret_dword
+
+;----------------------------------------------------------------------------
+; CFU_XACT: one raw transaction.  Payload (OUT/SETUP) copied to chip RAM
+; 0x10 first; IN data copied back to the response.
+;----------------------------------------------------------------------------
+ioc_xact:
+        cmp     [enabled], 0
+        je      ioc_notena
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbInBuffer], 4
+        jb      ioc_badbuf
+        mov     al, [edx+XQ_PIDEP]
+        mov     [xa_pidep], al
+        mov     al, [edx+XQ_DEVADDR]
+        mov     [xa_addr], al
+        mov     al, [edx+XQ_CTL]
+        mov     [xa_ctl], al
+        mov     al, [edx+XQ_LEN]
+        mov     [xa_len], al
+        ; copy any outbound payload into chip RAM
+        push    esi                     ; preserve DIOCParams ptr
+        test    byte ptr [xa_ctl], 04h
+        jz      @F
+        movzx   ecx, [xa_len]
+        jecxz   @F
+        lea     esi, [edx+XQ_DATA]
+        mov     al, 10h
+        call    buf_to_chip
+@@:
+        call    do_xact
+        pop     esi
+        jnc     @F
+        mov     eax, 0FFFFFFFFh         ; timeout marker
+        jmp     xact_status
+@@:     movzx   eax, al
+xact_status:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], XR_DATA + 120
+        jb      ioc_badbuf
+        mov     [edx+XR_STATUS], eax
+        mov     dword ptr [edx+XR_GOT], 0
+        ; IN transaction that ACKed: pull the data back
+        cmp     eax, 0FFFFFFFFh
+        je      xact_ret
+        test    al, 01h                 ; ACK?
+        jz      xact_ret
+        test    byte ptr [xa_ctl], 04h  ; only for IN
+        jnz     xact_ret
+        push    eax
+        mov     al, 04h                 ; remaining count
+        call    sl_rd
+        mov     cl, [xa_len]
+        sub     cl, al                  ; got = len - remaining
+        movzx   ecx, cl
+        mov     [edx+XR_GOT], ecx
+        jecxz   xact_pop
+        push    edi
+        lea     edi, [edx+XR_DATA]
+        mov     al, 10h
+        call    buf_from_chip
+        pop     edi
+xact_pop:
+        pop     eax
+xact_ret:
+        mov     edx, [esi.lpcbBytesReturned]
+        test    edx, edx
+        jz      @F
+        mov     dword ptr [edx], XR_DATA + 120
+@@:     xor     eax, eax
+        ret
+
+;----------------------------------------------------------------------------
+; CFU_CTRL: complete control transfer with NAK retry and data toggles.
+;----------------------------------------------------------------------------
+ioc_ctrl:
+        cmp     [enabled], 0
+        je      ioc_notena
+        push    ebx
+        push    edi
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ctrl_badbuf
+        cmp     [esi.cbInBuffer], CFU_CREQ_SIZE
+        jb      ctrl_badbuf
+        mov     edi, [esi.lpvOutBuffer]
+        test    edi, edi
+        jz      ctrl_badbuf
+        mov     eax, [esi.cbOutBuffer]
+        sub     eax, CFU_CRSP_HDR
+        jb      ctrl_badbuf
+        movzx   ecx, word ptr [edx+CQ_WLEN]
+        cmp     eax, ecx                ; room for the whole data stage?
+        jb      ctrl_badbuf
+        mov     dword ptr [edi+CR2_ERR], 0
+        mov     dword ptr [edi+CR2_GOT], 0
+
+        mov     al, [edx+CQ_DEVADDR]
+        mov     [xa_addr], al
+
+        ; ---- SETUP stage: 8 bytes, DATA0, OUT ----
+        push    esi
+        push    edx
+        lea     esi, [edx+CQ_SETUP]
+        mov     al, 10h
+        mov     ecx, 8
+        call    buf_to_chip
+        pop     edx
+        pop     esi
+        mov     [xa_pidep], 0D0h
+        mov     [xa_len], 8
+        mov     [xa_ctl], 07h           ; ARM|ENABLE|OUT, DATA0
+        call    do_xact_retry
+        jc      ctrl_setup_tmo
+        test    al, 01h
+        jnz     ctrl_data
+ctrl_setup_tmo:
+        mov     ah, al
+        jnc     @F
+        mov     ah, 0FFh
+@@:     mov     al, 1                   ; stage 1 failed
+        jmp     ctrl_fail
+
+        ; ---- DATA stage (IN only; OUT data stage not needed yet) ----
+ctrl_data:
+        movzx   ebx, word ptr [edx+CQ_WLEN]
+        test    ebx, ebx
+        jz      ctrl_status
+        test    byte ptr [edx+CQ_SETUP], 80h
+        jz      ctrl_status
+        mov     [ct_toggle], 40h        ; DATA1 first
+ctrl_data_loop:
+        mov     al, [edx+CQ_MPS]        ; always request a full packet;
+        mov     [xa_len], al            ; the device short-terminates
+        mov     [xa_pidep], 90h         ; IN, ep 0
+        mov     al, [ct_toggle]
+        or      al, 03h                 ; ARM|ENABLE
+        mov     [xa_ctl], al
+        call    do_xact_retry
+        jc      ctrl_data_tmo
+        test    al, 01h                 ; ACK?
+        jz      ctrl_data_bad
+        mov     al, 04h                 ; remaining count
+        call    sl_rd
+        mov     ah, [xa_len]
+        sub     ah, al
+        movzx   ecx, ah                 ; ECX = got this chunk
+        push    esi
+        push    edi
+        push    ecx
+        mov     eax, [edi+CR2_GOT]
+        lea     edi, [edi+CR2_DATA+eax]
+        mov     al, 10h
+        call    buf_from_chip
+        pop     ecx
+        pop     edi
+        pop     esi
+        add     [edi+CR2_GOT], ecx
+        xor     [ct_toggle], 40h
+        cmp     ecx, ebx
+        jae     ctrl_data_done          ; got everything requested
+        sub     ebx, ecx
+        movzx   eax, byte ptr [edx+CQ_MPS]
+        cmp     ecx, eax
+        jb      ctrl_data_done          ; short packet = device done early
+        jmp     ctrl_data_loop
+ctrl_data_tmo:
+        mov     ah, 0FFh
+        mov     al, 2
+        jmp     ctrl_fail
+ctrl_data_bad:
+        mov     ah, al
+        mov     al, 2
+        jmp     ctrl_fail
+ctrl_data_done:
+
+        ; ---- STATUS stage: opposite direction, DATA1, zero length ----
+ctrl_status:
+        mov     [xa_len], 0
+        test    byte ptr [edx+CQ_SETUP], 80h
+        jz      ctrl_status_in
+        mov     [xa_pidep], 10h         ; OUT status after IN data
+        mov     [xa_ctl], 47h           ; ARM|ENABLE|OUT|DATA1
+        jmp     @F
+ctrl_status_in:
+        mov     [xa_pidep], 90h         ; IN status after OUT/no data
+        mov     [xa_ctl], 43h           ; ARM|ENABLE|DATA1
+@@:     call    do_xact_retry
+        jc      ctrl_status_tmo
+        test    al, 01h
+        jnz     ctrl_ok
+        mov     ah, al
+        mov     al, 3
+        jmp     ctrl_fail
+ctrl_status_tmo:
+        mov     ah, 0FFh
+        mov     al, 3
+        jmp     ctrl_fail
+
+ctrl_ok:
+        xor     eax, eax
+        jmp     ctrl_out
+ctrl_fail:
+        movzx   eax, ax                 ; AL=stage AH=status
+        mov     [edi+CR2_ERR], eax
+        xor     eax, eax
+ctrl_out:
+        mov     edx, [esi.lpcbBytesReturned]
+        test    edx, edx
+        jz      @F
+        mov     ecx, [edi+CR2_GOT]
+        add     ecx, CFU_CRSP_HDR
+        mov     [edx], ecx
+@@:     pop     edi
+        pop     ebx
+        xor     eax, eax
+        ret
+ctrl_badbuf:
+        pop     edi
+        pop     ebx
+        mov     eax, CFUERR_BUFFER
+        ret
+
 ioc_notena:
         mov     eax, CFUERR_NOTENAB
         ret
@@ -835,6 +1169,133 @@ BeginProc ioc_unhook
         mov     [irqhandle], 0
 @@:     ret
 EndProc ioc_unhook
+
+;----------------------------------------------------------------------------
+; ring-0 USB transfer engine.
+; SL811 access at native port speed: address port = iobase, data = iobase+1.
+;----------------------------------------------------------------------------
+BeginProc sl_rd                         ; in: AL=reg  out: AL=val
+        push    edx
+        movzx   edx, [iobase]
+        out     dx, al
+        inc     edx
+        in      al, dx
+        pop     edx
+        ret
+EndProc sl_rd
+
+BeginProc sl_wr                         ; in: AL=reg AH=val
+        push    edx
+        movzx   edx, [iobase]
+        out     dx, al
+        inc     edx
+        mov     al, ah
+        out     dx, al
+        pop     edx
+        ret
+EndProc sl_wr
+
+BeginProc buf_to_chip                   ; ESI=src, AL=chip addr, ECX=count
+        push    edx
+        movzx   edx, [iobase]
+        out     dx, al                  ; set address (autoincrement follows)
+        inc     edx
+        jecxz   btc_done
+btc_loop:
+        lodsb
+        out     dx, al
+        loop    btc_loop
+btc_done:
+        pop     edx
+        ret
+EndProc buf_to_chip
+
+BeginProc buf_from_chip                 ; EDI=dst, AL=chip addr, ECX=count
+        push    edx
+        movzx   edx, [iobase]
+        out     dx, al
+        inc     edx
+        jecxz   bfc_done
+bfc_loop:
+        in      al, dx
+        stosb
+        loop    bfc_loop
+bfc_done:
+        pop     edx
+        ret
+EndProc buf_from_chip
+
+;----------------------------------------------------------------------------
+; do_xact: run one transaction on EP A using xa_* globals; the payload must
+; already be in chip RAM at 0x10.  Returns AL = SL811 packet status, or
+; carry set on completion timeout (~50ms).
+;----------------------------------------------------------------------------
+BeginProc do_xact
+        push    ecx
+        mov     al, 01h                 ; EP A buffer address
+        mov     ah, 10h
+        call    sl_wr
+        mov     al, 02h                 ; EP A buffer length
+        mov     ah, [xa_len]
+        call    sl_wr
+        mov     al, 03h                 ; PID | endpoint
+        mov     ah, [xa_pidep]
+        call    sl_wr
+        mov     al, 04h                 ; device address
+        mov     ah, [xa_addr]
+        call    sl_wr
+        mov     al, 0Dh                 ; clear interrupt status
+        mov     ah, 0FFh
+        call    sl_wr
+        mov     al, 00h                 ; EP A host control: go
+        mov     ah, [xa_ctl]
+        call    sl_wr
+        mov     ecx, 50000              ; ~50ms completion budget
+dx_poll:
+        mov     al, 0Dh
+        call    sl_rd
+        test    al, 01h                 ; DONE_A
+        jnz     dx_done
+        in      al, 80h                 ; ~1us
+        loop    dx_poll
+        pop     ecx
+        stc
+        ret
+dx_done:
+        mov     al, 03h                 ; packet status
+        call    sl_rd
+        pop     ecx
+        clc
+        ret
+EndProc do_xact
+
+;----------------------------------------------------------------------------
+; do_xact_retry: do_xact, retrying while the device NAKs (busy), up to
+; ~250 attempts with ~1ms spacing.  Same returns as do_xact.
+;----------------------------------------------------------------------------
+BeginProc do_xact_retry
+        push    ebx
+        push    ecx
+        mov     ebx, 250
+dxr_try:
+        call    do_xact
+        jc      dxr_out                 ; timeout
+        test    al, 40h                 ; NAK?
+        jz      dxr_out
+        mov     ecx, 1000               ; ~1ms then retry
+dxr_dly:
+        push    eax
+        in      al, 80h
+        pop     eax
+        loop    dxr_dly
+        dec     ebx
+        jnz     dxr_try
+        clc                             ; give up: return the NAK status
+dxr_out:
+        pop     ecx
+        pop     ebx
+        ret
+EndProc do_xact_retry
 
 ;----------------------------------------------------------------------------
 ; hardware interrupt handler: ack the SL811, count, EOI

@@ -236,3 +236,35 @@ New findings:
 Next: transfer engine inside the VxD (single-ioctl transactions; polled
 first, IRQ when the routing puzzle is solved) -> SET_ADDRESS + full
 enumeration -> HID interrupt-IN polling demo -> mass storage.
+
+## RING-0 TRANSFER ENGINE + LIVE HID — 2026-07-11 night
+
+VxD 1.20 moves USB transactions into ring 0 (native port speed, no more
+~1ms-per-register ioctl tax): CFU_USBINIT (bus reset + host init + SOF
+kickstart, LS/FS), CFU_XACT (raw EP A transaction, 50ms completion poll),
+CFU_CTRL (complete control transfer: SETUP/DATA/STATUS with NAK retry
+(~250x1ms), data toggles, mps-chunked IN stage, short-packet handling).
+
+Verified on the 235 (Win98, PnP-enabled card, boot-time auto-start with
+VxD 1.20 confirmed — Windows re-arbitrated the base to 0x260 this boot):
+
+* CFUDIAG /ENUM2 = full enumeration: speed probe -> GET_DESCRIPTOR(8) ->
+  mps discovery -> SET_ADDRESS 1 -> full 18-byte device descriptor ->
+  config descriptor parse (interfaces/endpoints/HID detect) ->
+  SET_CONFIGURATION 1. Test device identified: Logitech receiver
+  VID 046D PID C52F, 2 HID interfaces (boot mouse ep81 int 2ms mps 8;
+  consumer ep82 int 2ms mps 32).
+* CFUDIAG /HID 1 = live interrupt-IN polling at ~100Hz from ring 3
+  (Sleep(10) pacing): 164 mouse reports in 8s, correct boot-mouse format
+  (buttons + 16-bit dX + 16-bit dY), toggle tracking across reports.
+
+Notes: interrupt-IN polling from ring 3 via CFU_XACT is fine for a demo
+(NAK costs one ioctl round trip); a real HID driver wants the poll loop
+in the VxD on a timer. OUT data stages not implemented yet (nothing
+needed them). The /CONF /ENUM2 first run exposed that CFUDIAG's /CONF
+early-exit must enumerate every action flag - fixed.
+
+Milestone status: enumeration + control + interrupt transfers DONE.
+Remaining on the roadmap: bulk transfers + mass storage (BOT + drive
+letter integration), IRQ routing archaeology (LogConfig override), HID
+poll loop in the VxD, multi-device support if a hub ever matters.

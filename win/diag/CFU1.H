@@ -17,6 +17,9 @@
 #define CFU_PCICRD      0x100A  /* in: BYTE reg (socket-relative) out: DWORD*/
 #define CFU_PCICWR      0x100B  /* in: BYTE reg, BYTE val                   */
 #define CFU_GETCONF     0x100C  /* out: CFU_CONF                            */
+#define CFU_USBINIT     0x100D  /* in: BYTE lowspeed  out: DWORD INTSTAT    */
+#define CFU_XACT        0x100E  /* in: CFU_XREQ       out: CFU_XRSP         */
+#define CFU_CTRL        0x100F  /* in: CFU_CREQ       out: CFU_CRSP         */
 
 #pragma pack(push, 1)
 typedef struct {
@@ -45,6 +48,35 @@ typedef struct {
     unsigned char   corrb;      /* COR readback at CONFIG_START             */
     unsigned short  rsvd;
 } CFU_CONF;
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+typedef struct {                /* one raw transaction on EP A */
+    unsigned char   pidep;      /* PID<<4 | endpoint                        */
+    unsigned char   devaddr;
+    unsigned char   ctl;        /* EP A host control bits                   */
+    unsigned char   len;        /* <= 120                                   */
+    unsigned char   data[120];  /* OUT/SETUP payload                        */
+} CFU_XREQ;
+
+typedef struct {
+    unsigned long   status;     /* SL811 packet status; 0xFFFFFFFF timeout  */
+    unsigned long   got;        /* bytes received (IN)                      */
+    unsigned char   data[120];
+} CFU_XRSP;
+
+typedef struct {                /* complete control transfer */
+    unsigned char   devaddr;
+    unsigned char   mps;        /* ep0 max packet size                      */
+    unsigned short  wlen;       /* data stage length                        */
+    unsigned char   setup[8];
+} CFU_CREQ;
+
+typedef struct {
+    unsigned long   err;        /* 0 ok; low byte stage 1/2/3, byte1 status */
+    unsigned long   got;
+    unsigned char   data[256];
+} CFU_CRSP;
 #pragma pack(pop)
 
 #define CFUERR_NOCARD   1

@@ -92,7 +92,7 @@ CFU_VOLSTAT     equ 1024h       ; out: mounted, log_dcb, part_start,
                                 ;      part_len, drive_index
 CFU_IORTRACE    equ 1025h       ; out: DWORD total + 32*(func,flags,lba,cnt)
 
-VXD_VERSION     equ 00020006h   ; 2.06 - scatter-gather IORs (THE fix)
+VXD_VERSION     equ 00020007h   ; 2.07 - SG walk bounded by xfer_count
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -2781,23 +2781,30 @@ req_read:
         mov     [xbusy], 0
         jc      req_ioerr
         jmp     req_ok
-rr_sg:  mov     eax, [ebx + IOP_ior + IOR_buffer_ptr]
-        mov     [sg_cur], eax           ; -> null-terminated SGD list
+rr_sg:  mov     eax, [ebx + IOP_ior + IOR_xfer_count]
+        mov     [sg_left], eax          ; authoritative bound - the SGD
+        mov     eax, [ebx + IOP_ior + IOR_buffer_ptr]
+        mov     [sg_cur], eax           ; list may not be null-terminated           ; -> null-terminated SGD list
         push    ebx
-rr_sgl: mov     edx, [sg_cur]
+rr_sgl: cmp     dword ptr [sg_left], 0
+        je      rr_sgok
+        mov     edx, [sg_cur]
         mov     edi, [edx]              ; SG_buff_ptr (linear)
         test    edi, edi
         jz      rr_sgok
         mov     ecx, [edx+4]            ; SG_buff_size in bytes
         shr     ecx, 9                  ; -> sectors
         jz      rr_sgnext
+        cmp     ecx, [sg_left]
+        jbe     @F
+        mov     ecx, [sg_left]          ; clamp final segment
+@@:     mov     [sg_step], ecx
         mov     eax, [sg_lba]
         call    msc_do_read
         jc      rr_sgbad
-        mov     edx, [sg_cur]
-        mov     eax, [edx+4]
-        shr     eax, 9
+        mov     eax, [sg_step]
         add     [sg_lba], eax
+        sub     [sg_left], eax
 rr_sgnext:
         add     dword ptr [sg_cur], 8
         jmp     rr_sgl
@@ -2828,23 +2835,30 @@ req_write:
         mov     [xbusy], 0
         jc      req_ioerr
         jmp     req_ok
-rw_sg:  mov     eax, [ebx + IOP_ior + IOR_buffer_ptr]
-        mov     [sg_cur], eax
+rw_sg:  mov     eax, [ebx + IOP_ior + IOR_xfer_count]
+        mov     [sg_left], eax          ; authoritative bound - the SGD
+        mov     eax, [ebx + IOP_ior + IOR_buffer_ptr]
+        mov     [sg_cur], eax           ; list may not be null-terminated
         push    ebx
-rw_sgl: mov     edx, [sg_cur]
+rw_sgl: cmp     dword ptr [sg_left], 0
+        je      rw_sgok
+        mov     edx, [sg_cur]
         mov     esi, [edx]
         test    esi, esi
         jz      rw_sgok
         mov     ecx, [edx+4]
         shr     ecx, 9
         jz      rw_sgnext
+        cmp     ecx, [sg_left]
+        jbe     @F
+        mov     ecx, [sg_left]          ; clamp final segment
+@@:     mov     [sg_step], ecx
         mov     eax, [sg_lba]
         call    msc_do_write
         jc      rw_sgbad
-        mov     edx, [sg_cur]
-        mov     eax, [edx+4]
-        shr     eax, 9
+        mov     eax, [sg_step]
         add     [sg_lba], eax
+        sub     [sg_left], eax
 rw_sgnext:
         add     dword ptr [sg_cur], 8
         jmp     rw_sgl
@@ -2947,6 +2961,8 @@ rw_err: stc
 EndProc msc_rw
 
 sg_lba          dd      0               ; SG walk: current LBA
+sg_left         dd      0               ; SG walk: sectors remaining
+sg_step         dd      0               ; SG walk: sectors this segment
 sg_cur          dd      0               ; SG walk: current SGD entry
 rw_lba          dd      0
 rw_count        dd      0

@@ -31,6 +31,8 @@
 #define CFU_MSCSET      0x1018  /* in: BYTE addr, ep_in, ep_out             */
 #define CFU_MSCCMD      0x1019  /* in: cdblen,dir,datalen,cdb[16],out-data;
                                    out: DWORD csw, in-data                  */
+#define CFU_IOSREG      0x101A  /* register with IOS; out: DWORD reg_result */
+#define CFU_IOSSTAT     0x101B  /* out: total, lastfunc, regresult, cnt[16] */
 
 #pragma pack(push, 1)
 typedef struct {

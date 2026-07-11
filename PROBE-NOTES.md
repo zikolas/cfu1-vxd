@@ -433,3 +433,38 @@ literals.
 Still ring-3 request/response, not a drive letter. Drive-letter mounting
 needs an IOS-layer block driver (or a DOS device driver under real-mode)
 - the big remaining piece for "it shows up as E:".
+
+## DRIVE LETTER — Stage 1 + 2 progress (2026-07-12)
+
+Goal: make the USB stick appear as a drive letter in Windows 98 via the
+IOS (I/O Supervisor) block-device stack. Staged to de-risk.
+
+**Stage 1 DONE — ring-0 BOT (VxD 1.71):** msc_bulk_out/in + msc_bot run
+Bulk-Only Transport entirely in ring 0 over do_xact; CFU_MSCSET +
+CFU_MSCCMD ioctls; CFUDISK /R0 verified byte-identical reads (INQUIRY,
+capacity, FAT32 dir) to the ring-3 path. This is the read/write engine
+the IOS layer calls. Bug found: an ioctl handler must preserve ESI
+(DIOCParams ptr) across a helper call that trashes it (page fault 0E on
+the CSW write-back otherwise).
+
+**Stage 2b DONE — IOS registration proven (VxD 1.80):** modeled on the
+DDK block PORT sample. Added a DRP (feature DRP_FC_DYNALOAD since we load
+late via CONFIGMG), an ILB, and an AER (CFU1_IosAer). CFU_IOSREG calls
+IOS_Register (IOS device 0x10 svc 7); CFU_IOSSTAT reports the AEPs the
+AER received. Result on the 235: IOS_Register returned
+reg_result=1 (DRP_REMAIN_RESIDENT) and the AER got AEP_INITIALIZE (func
+0). So a dynamically-loaded VxD CAN register with IOS and receive async
+events — the key unknown, resolved. (The AER rejects events for now, so
+IOS goes no further.) Includes staged in ddkinc: drp/ilb/aep/ios.inc
+(all JWasm-clean). AEP funcs: INIT=0 BOOT_COMPLETE=2 CONFIG_DCB=3
+UNCONFIG_DCB=4 DEVICE_INQUIRY=6; results SUCCESS=0 FAIL=-1 NO_MORE=2.
+
+**Stage 2c NEXT — the drive letter:** AER must handle AEP_INITIALIZE
+(create a DDB via ISP_create_ddb) → AEP_DEVICE_INQUIRY (report the USB
+disk present) → AEP_CONFIG_DCB (insert our request routine into the DCB
+calldown, fill device geometry from READ CAPACITY) → service IOR
+read/write by calling msc_bot READ(10)/WRITE(10). Needs ring-0
+enumeration/mount in the VxD too (currently CFUDISK enumerates in ring-3).
+Risk: bad IOS interaction can hang the storage stack / touch the boot
+disk. Reboots are now autonomous (WREBOOT + FreeConsole), so iteration is
+fast.

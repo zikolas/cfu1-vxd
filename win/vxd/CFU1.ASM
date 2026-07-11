@@ -26,6 +26,10 @@
         include configmg.inc
         include vmd.inc
         include vkd.inc
+        include drp.inc
+        include ilb.inc
+        include aep.inc
+        include ios.inc
 
 ;----------------------------------------------------------------------------
 ; ioctl codes (keep in sync with win/diag/CFU1.H)
@@ -58,8 +62,10 @@ CFU_KBDSTAT     equ 1017h       ; out: 6 DWORDs (pipeline counters, debug)
 CFU_MSCSET      equ 1018h       ; in: BYTE addr, ep_in, ep_out (reset toggles)
 CFU_MSCCMD      equ 1019h       ; in: BYTE cdblen,dir; WORD datalen; 16 cdb;
                                 ;     [OUT data]  out: DWORD csw; [IN data]
+CFU_IOSREG      equ 101Ah       ; register with IOS; out: DWORD reg_result
+CFU_IOSSTAT     equ 101Bh       ; out: total, lastfunc, regresult, counts[16]
 
-VXD_VERSION     equ 00010701h   ; 1.71 - ring-0 mass storage (ESI-save fix)
+VXD_VERSION     equ 00010800h   ; 1.80 - IOS registration probe (Stage 2b)
 
 HIDRING_SLOTS   equ 32
 HIDSLOT_SIZE    equ 9
@@ -602,6 +608,10 @@ close_keep:
         je      ioc_mscset
         cmp     eax, CFU_MSCCMD
         je      ioc_msccmd
+        cmp     eax, CFU_IOSREG
+        je      ioc_iosreg
+        cmp     eax, CFU_IOSSTAT
+        je      ioc_iosstat
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -1557,6 +1567,46 @@ mcc_bad:
         mov     eax, CFUERR_BUFFER
         ret
 
+; CFU_IOSREG: register with IOS (dynamic).  IOS calls our AER during this.
+ioc_iosreg:
+        push    esi
+        push    OFFSET32 cfu_drp
+        VxDCall IOS_Register
+        add     esp, 4
+        pop     esi
+        movzx   eax, word ptr [cfu_drp.DRP_reg_result]
+        mov     [ios_regresult], eax
+        jmp     ret_dword
+
+; CFU_IOSSTAT: dump the AEP observation counters
+ioc_iosstat:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], 76    ; 3 dwords + 16 counts
+        jb      ioc_badbuf
+        mov     eax, [aep_total]
+        mov     [edx+0], eax
+        mov     eax, [aep_lastfunc]
+        mov     [edx+4], eax
+        mov     eax, [ios_regresult]
+        mov     [edx+8], eax
+        push    esi
+        push    edi
+        cld
+        mov     esi, OFFSET32 aep_counts
+        lea     edi, [edx+12]
+        mov     ecx, 16
+        rep     movsd
+        pop     edi
+        pop     esi
+        mov     ecx, [esi.lpcbBytesReturned]
+        test    ecx, ecx
+        jz      @F
+        mov     dword ptr [ecx], 76
+@@:     xor     eax, eax
+        ret
+
 ioc_notena:
         mov     eax, CFUERR_NOTENAB
         ret
@@ -1847,7 +1897,39 @@ msc_databuf     dd      0               ; linear address of data buffer
 msc_cdb         db      16 dup (0)
 msc_cbw         db      31 dup (0)
 msc_csw         db      16 dup (0)
+
+; --- IOS registration (Stage 2 of drive-letter): DRP + ILB + AEP log ---
+cfu_drp         DRP     <EyeCatcher, DRP_MISC_PD, OFFSET32 CFU1_IosAer, \
+                         OFFSET32 cfu_ilb, <'CFU1 USB Stg    '>, 0, \
+                         DRP_FC_DYNALOAD, 0>
+cfu_ilb         ILB     <>
+ios_regresult   dd      0
+aep_total       dd      0
+aep_lastfunc    dd      0
+aep_counts      dd      32 dup (0)
 VxD_LOCKED_DATA_ENDS
+
+;----------------------------------------------------------------------------
+; CFU1_IosAer: IOS asynchronous event routine.  Called by IOS as aer(AEP*).
+; Increment 2b: record which events arrive and reject them (AEP_FAILURE),
+; so we observe the linkage without claiming any device yet.
+;----------------------------------------------------------------------------
+BeginProc CFU1_IosAer
+        push    ebp
+        mov     ebp, esp
+        push    ebx
+        mov     ebx, [ebp+8]            ; AEP pointer
+        movzx   eax, word ptr [ebx]     ; AEP_func (offset 0)
+        inc     dword ptr [aep_total]
+        mov     [aep_lastfunc], eax
+        cmp     eax, 32
+        jae     @F
+        inc     dword ptr [aep_counts + eax*4]
+@@:     mov     word ptr [ebx+2], 0FFFFh ; AEP_result = AEP_FAILURE
+        pop     ebx
+        pop     ebp
+        ret
+EndProc CFU1_IosAer
 
 ; msc_bulk_out: ESI = linear src, ECX = length.  CF set on failure.
 BeginProc msc_bulk_out

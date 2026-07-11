@@ -25,8 +25,12 @@ mkdir -p "$WORK" ddkinc
 [ -f "$WORK/98ddk.rar" ] || curl -L -o "$WORK/98ddk.rar" "$DDK_URL"
 [ -d "$WORK/98DDK" ] || unar -q -o "$WORK" "$WORK/98ddk.rar"
 cabextract -q -d "$WORK/x" "$WORK/98DDK/CABS/I386/INCS_DDK.CAB"
+# block-device DDK (IOS structures for the drive-letter work)
+cabextract -q -d "$WORK/x" "$WORK/98DDK/CABS/I386/BLCK_DDK.CAB"
 
-for f in VMM VPICD PCCARD CONFIGMG VWIN32 DEBUG VMMREG BASEDEF REGSTR SHELL VXDLDR; do
+# VMM/HID/mouse/keyboard + IOS registration includes
+for f in VMM VPICD PCCARD CONFIGMG VWIN32 DEBUG VMMREG BASEDEF REGSTR SHELL \
+         VXDLDR VMD VKD DRP ILB AEP IOS; do
     lc=$(echo "$f" | tr 'A-Z' 'a-z')
     cp "$WORK/x/INC_WIN98_$f.INC" "ddkinc/$lc.inc"
 done

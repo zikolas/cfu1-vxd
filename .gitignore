@@ -15,3 +15,4 @@ ref/
 .DS_Store
 win/diag/CFUDIAG.EXE
 win/vxd/CFU1.VXD
+win/diag/CFUMOUSE.EXE

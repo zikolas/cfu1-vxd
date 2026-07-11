@@ -5,6 +5,13 @@ CF+ Card"** — a CompactFlash-sized USB 1.1 host controller card built
 around the Cypress/ScanLogic **SL811HS**. RATOC only ever shipped Windows
 CE drivers for it; this project makes the card work on PCs.
 
+<img src="docs/rex-cfu1.jpg" width="480"
+     alt="The REX-CFU1 in an IBM CF-to-PC-Card adapter, with its USB-A
+          dongle cable attached">
+
+*The REX-CFU1 with its USB-A dongle, seated in an IBM Microdrive
+CF-to-PC-Card adapter — as tested in a ThinkPad 235.*
+
 Current state: **a working, installable USB mouse driver for Windows
 98.** Insert the card and Windows PnP-installs it (INF + CONFIGMG-
 integrated VxD, auto-enabled at boot); plug a USB mouse into the card at

@@ -92,7 +92,7 @@ CFU_VOLSTAT     equ 1024h       ; out: mounted, log_dcb, part_start,
                                 ;      part_len, drive_index
 CFU_IORTRACE    equ 1025h       ; out: DWORD total + 32*(func,flags,lba,cnt)
 
-VXD_VERSION     equ 00020005h   ; 2.05 - IOR trace ring (evidence!)
+VXD_VERSION     equ 00020006h   ; 2.06 - scatter-gather IORs (THE fix)
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -2765,36 +2765,97 @@ req_media:
 req_read:
         cmp     byte ptr [msc_mounted], 0
         je      req_nomedia
-        mov     byte ptr [xbusy], 1
+        mov     [xbusy], 1
         mov     eax, [ebx + IOP_ior + IOR_start_addr]
-        ; since 2.03 the logical DCB has its OWN calldown chain (no IOS
-        ; translator entry), so WE translate volume-relative LBAs now
         test    dword ptr [ebx + IOP_ior + IOR_flags], 80000h
-        jz      @F
+        jz      @F                      ; volume-relative -> physical
         add     eax, [part_start]
-@@:     mov     ecx, [ebx + IOP_ior + IOR_xfer_count]   ; sector count
-        mov     edi, [ebx + IOP_ior + IOR_buffer_ptr]   ; dest buffer
-        push    ebx                     ; BOT engine trashes EBX (IOP ptr)
+@@:     mov     [sg_lba], eax
+        test    dword ptr [ebx + IOP_ior + IOR_flags], 2
+        jnz     rr_sg                   ; IORF_SCATTER_GATHER
+        mov     ecx, [ebx + IOP_ior + IOR_xfer_count]
+        mov     edi, [ebx + IOP_ior + IOR_buffer_ptr]
+        push    ebx
         call    msc_do_read
         pop     ebx
-        mov     byte ptr [xbusy], 0
+        mov     [xbusy], 0
         jc      req_ioerr
         jmp     req_ok
+rr_sg:  mov     eax, [ebx + IOP_ior + IOR_buffer_ptr]
+        mov     [sg_cur], eax           ; -> null-terminated SGD list
+        push    ebx
+rr_sgl: mov     edx, [sg_cur]
+        mov     edi, [edx]              ; SG_buff_ptr (linear)
+        test    edi, edi
+        jz      rr_sgok
+        mov     ecx, [edx+4]            ; SG_buff_size in bytes
+        shr     ecx, 9                  ; -> sectors
+        jz      rr_sgnext
+        mov     eax, [sg_lba]
+        call    msc_do_read
+        jc      rr_sgbad
+        mov     edx, [sg_cur]
+        mov     eax, [edx+4]
+        shr     eax, 9
+        add     [sg_lba], eax
+rr_sgnext:
+        add     dword ptr [sg_cur], 8
+        jmp     rr_sgl
+rr_sgok:
+        pop     ebx
+        mov     [xbusy], 0
+        jmp     req_ok
+rr_sgbad:
+        pop     ebx
+        mov     [xbusy], 0
+        jmp     req_ioerr
 req_write:
         cmp     byte ptr [msc_mounted], 0
         je      req_nomedia
-        mov     byte ptr [xbusy], 1
+        mov     [xbusy], 1
         mov     eax, [ebx + IOP_ior + IOR_start_addr]
         test    dword ptr [ebx + IOP_ior + IOR_flags], 80000h
-        jz      @F                      ; we are the translator now (2.04)
+        jz      @F
         add     eax, [part_start]
-@@:     mov     ecx, [ebx + IOP_ior + IOR_xfer_count]
+@@:     mov     [sg_lba], eax
+        test    dword ptr [ebx + IOP_ior + IOR_flags], 2
+        jnz     rw_sg                   ; IORF_SCATTER_GATHER
+        mov     ecx, [ebx + IOP_ior + IOR_xfer_count]
         mov     esi, [ebx + IOP_ior + IOR_buffer_ptr]
-        push    ebx                     ; BOT engine trashes EBX (IOP ptr)
+        push    ebx
         call    msc_do_write
         pop     ebx
-        mov     byte ptr [xbusy], 0
+        mov     [xbusy], 0
         jc      req_ioerr
+        jmp     req_ok
+rw_sg:  mov     eax, [ebx + IOP_ior + IOR_buffer_ptr]
+        mov     [sg_cur], eax
+        push    ebx
+rw_sgl: mov     edx, [sg_cur]
+        mov     esi, [edx]
+        test    esi, esi
+        jz      rw_sgok
+        mov     ecx, [edx+4]
+        shr     ecx, 9
+        jz      rw_sgnext
+        mov     eax, [sg_lba]
+        call    msc_do_write
+        jc      rw_sgbad
+        mov     edx, [sg_cur]
+        mov     eax, [edx+4]
+        shr     eax, 9
+        add     [sg_lba], eax
+rw_sgnext:
+        add     dword ptr [sg_cur], 8
+        jmp     rw_sgl
+rw_sgok:
+        pop     ebx
+        mov     [xbusy], 0
+        jmp     req_ok
+rw_sgbad:
+        pop     ebx
+        mov     [xbusy], 0
+        jmp     req_ioerr
 req_ok:
         mov     word ptr [ebx + IOP_ior + IOR_status], 0     ; IORS_SUCCESS
         jmp     req_done
@@ -2885,6 +2946,8 @@ rw_err: stc
         ret
 EndProc msc_rw
 
+sg_lba          dd      0               ; SG walk: current LBA
+sg_cur          dd      0               ; SG walk: current SGD entry
 rw_lba          dd      0
 rw_count        dd      0
 rw_buf          dd      0

@@ -194,6 +194,20 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    /* 0: who answers where?  (control-path address sweep) */
+    {
+        static unsigned char sweep[4] = { 0, 1, 9, 12 };
+        char lbl[40];
+        int k;
+        for (k = 0; k < 4; k++) {
+            sprintf(lbl, "GET_DESCRIPTOR(dev,8) @%u", sweep[k]);
+            g = ctl(sweep[k], 0x80, 6, 0x0100, 0, b, 8, &e);
+            perr(lbl, g, e);
+            if (g >= 8)
+                printf("    -> cls=%02X mps0=%u\n", b[4], b[7]);
+        }
+    }
+
     /* 1: device-level sanity at addr 1 */
     g = ctl(1, 0x80, 6, 0x0100, 0, b, 8, &e);
     perr("GET_DESCRIPTOR(device,8)", g, e);

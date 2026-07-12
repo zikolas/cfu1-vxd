@@ -48,9 +48,10 @@
                                    part_len, drive_index (5 DWORDs)         */
 #define CFU_IORTRACE    0x1025  /* out: DWORD total + 32*(func,flags,lba,n) */
 #define CFU_IRQTEST     0x1026  /* in: BYTE irq; out: DWORD count (~1s)     */
-#define CFU_HUBSTAT     0x1027  /* out: 15 DWORDs: nports, port, naddr,
+#define CFU_HUBSTAT     0x1027  /* out: 18 DWORDs: nports, port, naddr,
                                    conn, rescan, pwrfail, p2pg, estage,
-                                   pstat[7] (FFFFFFFF fail, FFFFFFFE short) */
+                                   pstat[7] (FFFFFFFF fail, FFFFFFFE short),
+                                   hid_port, hd2_port, parked mask          */
 
 #pragma pack(push, 1)
 typedef struct {

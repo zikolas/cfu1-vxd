@@ -94,10 +94,11 @@ CFU_IORTRACE    equ 1025h       ; out: DWORD total + 32*(func,flags,lba,cnt)
 CFU_IRQTEST     equ 1026h       ; in: BYTE irq; hook+count SOF ints ~1s with
                                 ; exclusive chip ownership, park after;
                                 ; out: DWORD count
-CFU_HUBSTAT     equ 1027h       ; out: 15 DWORDs: nports, port, naddr, conn,
-                                ; rescan, pwrfail, p2pg, estage, pstat[7]
+CFU_HUBSTAT     equ 1027h       ; out: 18 DWORDs: nports, port, naddr, conn,
+                                ; rescan, pwrfail, p2pg, estage, pstat[7],
+                                ; hid_port, hd2_port, parked mask
 
-VXD_VERSION     equ 00020023h   ; 2.23 - hub diag (HUBSTAT) + rescan + hub_mps
+VXD_VERSION     equ 00020027h   ; 2.27 - watchdog + gentler port scan
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -1468,12 +1469,12 @@ ioc_autostat:
         or      al, 2
 @@:     jmp     ret_dword
 
-; CFU_HUBSTAT: hub-descent diagnostics, 15 DWORDs
+; CFU_HUBSTAT: hub-descent diagnostics, 18 DWORDs
 ioc_hubstat:
         mov     edx, [esi.lpvOutBuffer]
         test    edx, edx
         jz      ioc_badbuf
-        cmp     [esi.cbOutBuffer], 60
+        cmp     [esi.cbOutBuffer], 72
         jb      ioc_badbuf
         movzx   eax, byte ptr [hub_nports]
         mov     [edx+0], eax
@@ -1497,10 +1498,16 @@ ioc_hubstat:
         inc     ecx
         cmp     ecx, 7
         jb      @B
+        movzx   eax, byte ptr [hid_port]
+        mov     [edx+60], eax
+        movzx   eax, byte ptr [hd2_port]
+        mov     [edx+64], eax
+        movzx   eax, byte ptr [hub_parked]
+        mov     [edx+68], eax
         mov     ecx, [esi.lpcbBytesReturned]
         test    ecx, ecx
         jz      @F
-        mov     dword ptr [ecx], 60
+        mov     dword ptr [ecx], 72
 @@:     xor     eax, eax
         ret
 
@@ -2819,7 +2826,11 @@ hub_pwrfail     db      0               ; failed PORT_POWER transfers (diag)
 hub_p2pg        db      0               ; bPwrOn2PwrGood, 2ms units (diag)
 hub_wait        db      0               ; ticks in state 13 until a rescan
 hub_estage      db      0               ; how far the last port enum got (diag)
-                db      1 dup (0)
+hid_port        db      0               ; hub port bound to the primary slot
+hd2_port        db      0               ; hub port bound to slot B
+hub_parked      db      0               ; bitmask: enumerated but unslottable
+hub_dead        db      0               ; consecutive failed port GET_STATUSes
+hub_slow        db      0               ; tick divider for the port scan
 hub_pstat       dd      7 dup (0)       ; last GET_STATUS(port), 1 dword/port
                                         ; (FFFFFFFF = xfer fail, FFFFFFFE short)
 vol_secbuf      db      512 dup (0)     ; MBR parse buffer
@@ -3689,7 +3700,7 @@ BeginProc CFU1_SupTick, High_Freq
         cmp     eax, 12
         je      sup_hubenum
         cmp     eax, 13
-        je      sup_hubrun
+        je      sup_hubscan             ; legacy hub-run state folds into 11
         mov     [sup_state], 0
         jmp     sup_out
 
@@ -3851,8 +3862,11 @@ sup_cl_hub:
         mov     al, 7                   ; sanity cap
 @@:     mov     [hub_nports], al
         mov     byte ptr [hub_port], 1
-        mov     byte ptr [hub_naddr], 2
+        mov     byte ptr [hub_naddr], 0
         mov     [hd2_act], 0
+        mov     [hid_port], 0
+        mov     [hd2_port], 0
+        mov     [hub_parked], 0
         mov     al, [sup_mps]           ; sup_mps still = the hub's ep0 mps
         mov     [hub_mps], al           ; (downstream enum will clobber it)
         mov     [hub_conn], 0
@@ -3874,9 +3888,42 @@ sup_cl_hub:
         jmp     sup_out
 
 sup_hubscan:
-        mov     cl, [hub_port]
+        ; continuous hub supervisor: watch the hub itself every tick, then
+        ; service ONE port per tick (round-robin) — new CONNECTION on a
+        ; free-slot port -> reset+enumerate; lost CONNECTION on a bound
+        ; port -> tear that slot down; parked ports clear on disconnect
+        mov     al, 0Dh                 ; hub still attached?
+        call    sl_rd
+        test    al, 40h
+        jz      hb_here
+        inc     [sup_absent]
+        cmp     [sup_absent], 3
+        jb      sup_out
+hb_teardown:
+        call    hid_stop                ; hub gone: tear everything down
+        mov     [hd2_act], 0
+        mov     [sup_armed], 0
+        mov     [hid_port], 0
+        mov     [hd2_port], 0
+        mov     [hub_parked], 0
+        mov     [hub_dead], 0
+        mov     [sup_absent], 0
+        mov     [sup_state], 0          ; state 0 = bus reset + re-descent,
+        jmp     sup_out                 ; which revives a crashed hub brain
+hb_here:
+        mov     [sup_absent], 0
+        ; ~4 control transfers/s of port polling wears cheap hub firmware
+        ; down (recurring ep0 crashes) — service a port every 4th tick only
+        inc     [hub_slow]
+        test    [hub_slow], 3
+        jnz     sup_out
+        mov     cl, [hub_port]          ; port cursor wraps 1..nports
         cmp     cl, [hub_nports]
-        ja      hs_alldone
+        jbe     @F
+        mov     cl, 1
+        mov     [hub_port], cl
+        inc     [hub_rescan]            ; diag: completed passes
+@@:
         ; GET_STATUS(port): 4 bytes; bit0 of byte0 = connected
         mov     al, 0A3h
         mov     ah, 00h
@@ -3895,8 +3942,25 @@ sup_hubscan:
         movzx   ecx, byte ptr [hub_port]        ; record for CFU_HUBSTAT
         mov     eax, dword ptr [ct_buf]
         mov     [hub_pstat + ecx*4 - 4], eax
+        mov     [hub_dead], 0           ; the hub is talking to us
+        mov     cl, [hub_port]
         test    byte ptr [ct_buf], 01h
-        jz      hs_next                 ; nothing on this port
+        jz      hs_gone
+        ; connected: bound or parked ports are healthy — leave them be
+        cmp     cl, [hid_port]
+        je      hs_next
+        cmp     cl, [hd2_port]
+        je      hs_next
+        call    hub_pbit                ; AL = bit for port CL
+        test    [hub_parked], al
+        jnz     hs_next
+        ; new device: only enumerate if a slot is free (class unknown
+        ; until enum, so with both slots busy just leave it for later)
+        cmp     [sup_armed], 0
+        je      hs_enum
+        cmp     [hd2_act], 0
+        jne     hs_next
+hs_enum:
         inc     [hub_conn]
         ; reset it; enumerate on the next tick
         mov     al, 23h
@@ -3910,9 +3974,29 @@ sup_hubscan:
         call    do_control
         mov     [sup_state], 12
         jmp     sup_out
+hs_gone:
+        ; port empty: free whatever was tied to it
+        call    hub_pbit
+        not     al
+        and     [hub_parked], al
+        cmp     cl, [hid_port]
+        jne     @F
+        call    hid_stop
+        mov     [sup_armed], 0
+        mov     [hid_port], 0
+@@:     cmp     cl, [hd2_port]
+        jne     hs_next
+        mov     [hd2_act], 0
+        mov     [hd2_port], 0
+        jmp     hs_next
 hs_fail:
         movzx   ecx, byte ptr [hub_port]
         mov     dword ptr [hub_pstat + ecx*4 - 4], 0FFFFFFFFh
+        ; a mute hub (crashed brain: forwards traffic, ep0 dead) never
+        ; trips the detach check — watchdog it back to a bus reset
+        inc     [hub_dead]
+        cmp     [hub_dead], 8           ; ~8s at the 1-port/s scan rate
+        jae     hb_teardown
         jmp     hs_next
 hs_short:
         movzx   ecx, byte ptr [hub_port]
@@ -3920,13 +4004,12 @@ hs_short:
 hs_next:
         inc     byte ptr [hub_port]
         jmp     sup_out
-hs_alldone:
-        mov     [hub_wait], 16          ; rescan in ~4s if nothing enumerated
-        mov     [sup_state], 13
-        jmp     sup_out
 
 sup_hubenum:
         mov     [hub_estage], 1         ; 1 = entered port enum
+        mov     al, [hub_port]          ; per-port device address (8+port):
+        add     al, 8                   ; unique forever -> replug reuses it,
+        mov     [hub_naddr], al         ; parked devices collide with nobody
         ; clear C_PORT_RESET, then bring the downstream device up
         mov     al, 23h
         mov     ah, 01h
@@ -4035,8 +4118,32 @@ sup_hubenum:
         call    do_control
         cmp     byte ptr [ct_buf+16], 1 ; keyboard?
         jne     he_mouse
-        cmp     [sup_armed], 0          ; keyboard takes the primary slot
-        jne     he_next                 ; (stateful pipeline lives there)
+        ; the keyboard OWNS the primary slot (stateful pipeline lives
+        ; there).  If a mouse got there first — enum order is a race, the
+        ; kbd may fumble its first try at boot — demote it to slot B.
+        cmp     [sup_armed], 0
+        je      he_kbd_arm
+        cmp     [hid_mode], 1           ; primary holds a mouse?
+        jne     he_park                 ; no: a second keyboard -> park
+        cmp     [hd2_act], 0            ; slot B free for the demotion?
+        jne     he_park
+        call    hid_stop                ; poll timer restarts at hid_arm
+        mov     al, [hid_addr]
+        mov     [hd2_addr], al
+        mov     al, [hid_ep]
+        mov     [hd2_ep], al
+        mov     al, [hid_mps]
+        mov     [hd2_mps], al
+        mov     [hd2_tog], 0
+        mov     [hd2_mode], 1
+        mov     al, [hid_pre]
+        mov     [hd2_pre], al
+        mov     al, [hid_port]
+        mov     [hd2_port], al
+        mov     [hd2_act], 1
+        mov     [sup_armed], 0
+        mov     [hid_port], 0
+he_kbd_arm:
         mov     al, [hub_naddr]
         mov     [hid_addr], al
         mov     [hid_ep], 1
@@ -4045,6 +4152,8 @@ sup_hubenum:
         mov     [hid_mode], 2
         mov     al, [dev_ls]
         mov     [hid_pre], al
+        mov     al, [hub_port]
+        mov     [hid_port], al
         call    hid_arm
         mov     [sup_armed], 1
         jmp     he_next
@@ -4059,10 +4168,14 @@ he_mouse:
         mov     [hid_mode], 1
         mov     al, [dev_ls]
         mov     [hid_pre], al
+        mov     al, [hub_port]
+        mov     [hid_port], al
         call    hid_arm
         mov     [sup_armed], 1
         jmp     he_next
 he_m2:
+        cmp     [hd2_act], 0            ; slot B free?  (shouldn't happen —
+        jne     he_park                 ; the scan gates on a free slot)
         mov     al, [hub_naddr]
         mov     [hd2_addr], al
         mov     [hd2_ep], 1
@@ -4071,44 +4184,23 @@ he_m2:
         mov     [hd2_mode], 1
         mov     al, [dev_ls]
         mov     [hd2_pre], al
+        mov     al, [hub_port]
+        mov     [hd2_port], al
         mov     [hd2_act], 1
+        jmp     he_next
+he_park:
+        ; enumerated but no slot for it (e.g. a second keyboard): leave
+        ; it addressed+idle and stop rescanning it until it disconnects
+        mov     cl, [hub_port]
+        call    hub_pbit
+        or      [hub_parked], al
+        mov     [hub_estage], 6         ; 6 = parked
+        jmp     he_skip
 he_next:
-        mov     [hub_estage], 5         ; 5 = armed / address consumed
-        inc     byte ptr [hub_naddr]
+        mov     [hub_estage], 5         ; 5 = armed
 he_skip:
         mov     byte ptr [ct_pre], 0    ; preamble only during LS enum
         inc     byte ptr [hub_port]
-        mov     [sup_state], 11
-        jmp     sup_out
-
-sup_hubrun:
-        mov     al, 0Dh                 ; hub still attached?
-        call    sl_rd
-        test    al, 40h
-        jz      hr_still
-        inc     [sup_absent]
-        cmp     [sup_absent], 3
-        jb      sup_out
-        call    hid_stop
-        mov     [hd2_act], 0
-        mov     [sup_armed], 0
-        mov     [sup_absent], 0
-        mov     [sup_state], 0
-        jmp     sup_out
-hr_still:
-        mov     [sup_absent], 0
-        ; nothing enumerated behind the hub yet?  slow/ganged port power can
-        ; miss the first pass entirely — re-power and rescan every ~4s
-        cmp     [sup_armed], 0
-        jne     sup_out
-        cmp     [hd2_act], 0
-        jne     sup_out
-        dec     [hub_wait]
-        jnz     sup_out
-        inc     [hub_rescan]
-        mov     [hub_conn], 0
-        call    hub_pwr_all
-        mov     byte ptr [hub_port], 1
         mov     [sup_state], 11
         jmp     sup_out
 
@@ -4192,6 +4284,16 @@ EndProc CFU1_SupTick
 ; hub_pwr_all: SET_FEATURE(PORT_POWER) on hub ports 1..hub_nports (hub is
 ; always downstream addr 1).  Counts failures in hub_pwrfail for CFU_HUBSTAT.
 ;----------------------------------------------------------------------------
+; hub_pbit: AL = port bit (1 << (CL-1)) for the hub_parked mask; CL preserved
+BeginProc hub_pbit
+        push    ecx
+        mov     al, 1
+        dec     cl
+        shl     al, cl
+        pop     ecx
+        ret
+EndProc hub_pbit
+
 BeginProc hub_pwr_all
         mov     cl, 1
 hp_next:

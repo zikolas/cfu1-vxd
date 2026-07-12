@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include "cfu1.h"
 int main(void){
-    HANDLE h; DWORD s=0,r=0,hs[15]; int i; char p[]="\\\\.\\CFU1.VXD";
+    HANDLE h; DWORD s=0,r=0,hs[18]; int i; char p[]="\\\\.\\CFU1.VXD";
     h=CreateFile(p,0,0,NULL,0,0,NULL);
     if(h==INVALID_HANDLE_VALUE){printf("no vxd\n");return 1;}
     if(DeviceIoControl(h,CFU_AUTOSTAT,NULL,0,&s,4,&r,NULL))
@@ -16,6 +16,8 @@ int main(void){
         printf("hub: nports=%lu port=%lu naddr=%lu conn=%lu rescan=%lu "
                "pwrfail=%lu p2pg=%lums estage=%lu\n",
                hs[0],hs[1],hs[2],hs[3],hs[4],hs[5],hs[6]*2,hs[7]);
+        printf("slots: primary=port %lu  B=port %lu  parked=%02lX\n",
+               hs[15], hs[16], hs[17]);
         for(i=0;i<7 && (DWORD)i<hs[0];i++){
             printf("  port %d: ",i+1);
             if(hs[8+i]==0xFFFFFFFFUL)      printf("GET_STATUS FAILED\n");

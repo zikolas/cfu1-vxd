@@ -102,8 +102,8 @@ CFU_ASYNCA      equ 1028h       ; in: BYTE 1/0 = stage-A IRQ completion
 CFU_ASYNCST     equ 1029h       ; out: 4 DWORDs: irqcount, windows completed
                                 ; by IRQ, windows timed out, amode
 
-VXD_VERSION     equ 00020036h   ; 2.36 - count-reg guard (the canary killer)
-                                ;        + handler leaves DONE latched
+VXD_VERSION     equ 00020037h   ; 2.37 - detach fix: supervisor resumes after
+                                ;        mount + xbusy watchdog
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -2243,7 +2243,15 @@ vup_mounted:
         jne     vup_done
         call    vol_create
 vup_done:
-        mov     [vol_busy], 0
+        ; THE TEARDOWN BUG'S ROOT CAUSE: msc_mount stops the supervisor to
+        ; own the chip, and nothing ever restarted it — so after every
+        ; successful mount the detach detector existed but never ticked
+        ; (E: lingered after a pull, a later mouse was never seen).
+        ; Resume in disk-run state, NO bus reset: the mount must survive.
+        cmp     [enabled], 0
+        je      @F
+        call    sup_resume_disk
+@@:     mov     [vol_busy], 0
         pop     edi
         pop     esi
         pop     ebx
@@ -2989,7 +2997,8 @@ awin_tmo        dd      0               ; windows that timed out (diag)
 bot_stage       db      0               ; failing BOT phase: 1=CBW 2=data-out
                                         ; 3=data-in 4=CSW (0 = no failure)
 bot_st          db      0               ; SL811 status there (FF = timeout)
-                db      2 dup (0)
+sup_busyct      db      0               ; consecutive xbusy-blocked ticks
+                db      1 dup (0)
 iortr_idx       dd      0               ; trace ring write index
 iortr_ring      dd      128 dup (0)     ; 32 x (func, flags, lba, count)
 acanary         dd      0BEEFCAFEh      ; guards the segment end: something
@@ -3855,7 +3864,8 @@ BeginProc CFU1_SupTick, High_Freq
         cmp     [enabled], 0
         jz      sup_out
         cmp     [xbusy], 0              ; a real transfer owns EP A: wait
-        jnz     sup_out
+        jnz     sup_busyw
+        mov     [sup_busyct], 0
         mov     [xr_tries], 10          ; tight NAK budget at event time
 
         movzx   eax, [sup_state]
@@ -4458,6 +4468,17 @@ sup_still:
 
 sup_reidle:                             ; enumeration step failed: retry later
         mov     [sup_state], 0
+        jmp     sup_out
+sup_busyw:
+        ; xbusy watchdog: legit holders finish in <1 tick (4KB IOR ~70ms)
+        ; or ~4 ticks (IRQ test).  ~5s of consecutive busy = a leaked
+        ; error path wedged the engine — force-free it so input and
+        ; detach detection can never freeze forever.
+        inc     [sup_busyct]
+        cmp     [sup_busyct], 20
+        jb      sup_out
+        mov     [xbusy], 0
+        mov     [sup_busyct], 0
 sup_out:
         ret
 EndProc CFU1_SupTick
@@ -4518,6 +4539,29 @@ BeginProc sup_start
 ss_done:
         ret
 EndProc sup_start
+
+; sup_resume_disk: restart the supervisor tick in disk-run state after a
+; ring-0 mount stopped it (msc_mount calls sup_stop to own the chip).
+; No bus reset — the freshly mounted device must survive.  Idempotent.
+; If the mount FAILED (msc_mounted=0), state 10's sup_retry logic then
+; re-attempts vol_up every ~4s — late-answering sticks self-heal too.
+BeginProc sup_resume_disk
+        cmp     [sup_run], 0
+        jnz     srd_done
+        mov     [sup_run], 1
+        mov     [sup_absent], 0
+        mov     [sup_retry], 0
+        mov     [sup_state], 10         ; watch the mounted disk
+        push    esi
+        mov     eax, 250
+        xor     edx, edx
+        mov     esi, OFFSET32 CFU1_SupTick
+        VMMCall Set_Global_Time_Out
+        mov     [sup_handle], esi
+        pop     esi
+srd_done:
+        ret
+EndProc sup_resume_disk
 
 BeginProc sup_stop
         mov     [sup_run], 0

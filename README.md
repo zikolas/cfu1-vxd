@@ -46,13 +46,16 @@ bulk) over a simple ioctl API.
 >   and don't trust files you copy *onto* one through this driver;
 > * expect single small files to work and larger copies to be roulette
 >   (small reads/writes verified byte-exact; bulk copies can crash the
->   whole machine);
-> * hot-unplug teardown still doesn't fire (drive letter lingers, an
->   absent-media click wrongly offers to *format*, and the shared USB
->   engine can wedge until a reboot) — insert media at boot, reboot to
->   remove;
+>   whole machine — though the most recent fresh-boot folder copy did
+>   complete without errors, modulo the UI freezing during I/O);
 > * treat any machine running the storage path as a lab machine: hard
 >   resets and boot-time scandisks are part of the experience.
+>
+> One storage milestone did just land: **hot-unplug now tears down
+> properly** — pull the stick and E: disappears within a couple of
+> seconds, an absent-media poke reports *not ready* (never "format?"),
+> a mouse plugged in afterwards just works, and re-inserting the stick
+> remounts it automatically.
 >
 > The interrupt-driven transfer engine on the roadmap is the intended
 > cure for this class of problem; until it lands, storage stays in the
@@ -293,11 +296,16 @@ CPEEK E              enumerate all of IOS's DCBs
       has blue-screened Windows with a file-corruption warning — see
       the warning at the top. Storage is currently not recommended for
       any use.**
-- [~] Removable-drive lifecycle: removable/write-through presentation and
-      a CFUEJECT tool (+ /UP remount) are in, but **hot-unplug teardown
-      doesn't fire** (drive letter lingers, USB engine wedges until
-      reboot) and the bulk-copy crash above makes the whole storage
-      path experimental - the current top storage bugs
+- [x] Removable-drive lifecycle: removable/write-through presentation,
+      CFUEJECT (+ /UP remount), and **working hot-unplug teardown** -
+      pull the stick and E: vanishes, absent-media pokes say *not
+      ready*, a mouse inserted afterwards enumerates, re-inserting the
+      stick remounts. (Root cause was a one-liner: the ring-0 mount
+      stopped the hot-plug supervisor to own the chip and nothing ever
+      resumed it, so the detach detector never ticked. A watchdog now
+      also force-frees the transfer engine if an error path leaks the
+      busy guard.) The bulk-copy stability question above remains the
+      reason storage stays experimental.
 - [x] IRQ delivery under Windows: confirmed on the Windows-assigned
       IRQ 15 (VPICD hook + PCIC steering, ~1400 SOF interrupts/s in the
       canned CFU_IRQTEST) — with the hard-won rule that an IRQ handler

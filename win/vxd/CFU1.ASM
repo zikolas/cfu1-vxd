@@ -94,8 +94,10 @@ CFU_IORTRACE    equ 1025h       ; out: DWORD total + 32*(func,flags,lba,cnt)
 CFU_IRQTEST     equ 1026h       ; in: BYTE irq; hook+count SOF ints ~1s with
                                 ; exclusive chip ownership, park after;
                                 ; out: DWORD count
+CFU_HUBSTAT     equ 1027h       ; out: 15 DWORDs: nports, port, naddr, conn,
+                                ; rescan, pwrfail, p2pg, estage, pstat[7]
 
-VXD_VERSION     equ 00020022h   ; 2.22 - PRE for low-speed behind hub
+VXD_VERSION     equ 00020023h   ; 2.23 - hub diag (HUBSTAT) + rescan + hub_mps
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -675,6 +677,8 @@ close_keep:
         je      ioc_iortrace
         cmp     eax, CFU_IRQTEST
         je      ioc_irqtest
+        cmp     eax, CFU_HUBSTAT
+        je      ioc_hubstat
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -1463,6 +1467,42 @@ ioc_autostat:
         jz      @F
         or      al, 2
 @@:     jmp     ret_dword
+
+; CFU_HUBSTAT: hub-descent diagnostics, 15 DWORDs
+ioc_hubstat:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], 60
+        jb      ioc_badbuf
+        movzx   eax, byte ptr [hub_nports]
+        mov     [edx+0], eax
+        movzx   eax, byte ptr [hub_port]
+        mov     [edx+4], eax
+        movzx   eax, byte ptr [hub_naddr]
+        mov     [edx+8], eax
+        movzx   eax, byte ptr [hub_conn]
+        mov     [edx+12], eax
+        movzx   eax, byte ptr [hub_rescan]
+        mov     [edx+16], eax
+        movzx   eax, byte ptr [hub_pwrfail]
+        mov     [edx+20], eax
+        movzx   eax, byte ptr [hub_p2pg]
+        mov     [edx+24], eax
+        movzx   eax, byte ptr [hub_estage]
+        mov     [edx+28], eax
+        xor     ecx, ecx
+@@:     mov     eax, [hub_pstat + ecx*4]
+        mov     [edx+32+ecx*4], eax
+        inc     ecx
+        cmp     ecx, 7
+        jb      @B
+        mov     ecx, [esi.lpcbBytesReturned]
+        test    ecx, ecx
+        jz      @F
+        mov     dword ptr [ecx], 60
+@@:     xor     eax, eax
+        ret
 
 ; CFU_FORCEKEY: bulk-inject the raw scan-code buffer via VKD_Force_Keys
 ; (VKD self-test: ESI = buffer, ECX = count).
@@ -2771,6 +2811,17 @@ dev_ls          db      0               ; last-enumerated device is LS
 sup_armmode     db      1               ; hid_mode to arm (1=mouse 2=kbd)
 dc_tog          db      0               ; do_control DATA-IN toggle scratch
                 db      1 dup (0)
+hub_mps         db      8               ; the HUB's own ep0 mps (sup_mps gets
+                                        ; overwritten by downstream enum)
+hub_conn        db      0               ; ports showing CONNECTION this pass
+hub_rescan      db      0               ; rescan passes taken (diag)
+hub_pwrfail     db      0               ; failed PORT_POWER transfers (diag)
+hub_p2pg        db      0               ; bPwrOn2PwrGood, 2ms units (diag)
+hub_wait        db      0               ; ticks in state 13 until a rescan
+hub_estage      db      0               ; how far the last port enum got (diag)
+                db      1 dup (0)
+hub_pstat       dd      7 dup (0)       ; last GET_STATUS(port), 1 dword/port
+                                        ; (FFFFFFFF = xfer fail, FFFFFFFE short)
 vol_secbuf      db      512 dup (0)     ; MBR parse buffer
 ior_counts      dd      48 dup (0)      ; per-IOR_func counters (0..2Fh)
 iortr_idx       dd      0               ; trace ring write index
@@ -3802,22 +3853,22 @@ sup_cl_hub:
         mov     byte ptr [hub_port], 1
         mov     byte ptr [hub_naddr], 2
         mov     [hd2_act], 0
-        ; SET_FEATURE(PORT_POWER) on every port
-        mov     cl, 1
-hb_pwr: push    ecx
-        mov     al, 23h
-        mov     ah, 03h
-        mov     bx, 8                   ; PORT_POWER
-        movzx   cx, cl
-        xor     dx, dx
-        call    setup_pkt
-        mov     [ct_addr], 1
-        mov     dword ptr [ct_wlen], 0
-        call    do_control
-        pop     ecx
-        inc     cl
-        cmp     cl, [hub_nports]
-        jbe     hb_pwr
+        mov     al, [sup_mps]           ; sup_mps still = the hub's ep0 mps
+        mov     [hub_mps], al           ; (downstream enum will clobber it)
+        mov     [hub_conn], 0
+        mov     [hub_rescan], 0
+        mov     [hub_pwrfail], 0
+        mov     [hub_estage], 0
+        mov     [hub_p2pg], 0
+        xor     eax, eax
+        mov     ecx, 7
+@@:     mov     [hub_pstat + ecx*4 - 4], eax
+        loop    @B
+        cmp     dword ptr [ct_got], 6   ; hub desc byte 5 = bPwrOn2PwrGood
+        jb      @F
+        mov     al, [ct_buf+5]
+        mov     [hub_p2pg], al
+@@:     call    hub_pwr_all             ; SET_FEATURE(PORT_POWER), every port
         mov     [sup_absent], 0
         mov     [sup_state], 11
         jmp     sup_out
@@ -3834,15 +3885,19 @@ sup_hubscan:
         mov     dx, 4
         call    setup_pkt
         mov     [ct_addr], 1
-        mov     al, [sup_mps]
+        mov     al, [hub_mps]
         mov     [ct_mps], al
         mov     dword ptr [ct_wlen], 4
         call    do_control
-        jc      hs_next
+        jc      hs_fail
         cmp     dword ptr [ct_got], 1
-        jb      hs_next
+        jb      hs_short
+        movzx   ecx, byte ptr [hub_port]        ; record for CFU_HUBSTAT
+        mov     eax, dword ptr [ct_buf]
+        mov     [hub_pstat + ecx*4 - 4], eax
         test    byte ptr [ct_buf], 01h
         jz      hs_next                 ; nothing on this port
+        inc     [hub_conn]
         ; reset it; enumerate on the next tick
         mov     al, 23h
         mov     ah, 03h
@@ -3855,14 +3910,23 @@ sup_hubscan:
         call    do_control
         mov     [sup_state], 12
         jmp     sup_out
+hs_fail:
+        movzx   ecx, byte ptr [hub_port]
+        mov     dword ptr [hub_pstat + ecx*4 - 4], 0FFFFFFFFh
+        jmp     hs_next
+hs_short:
+        movzx   ecx, byte ptr [hub_port]
+        mov     dword ptr [hub_pstat + ecx*4 - 4], 0FFFFFFFEh
 hs_next:
         inc     byte ptr [hub_port]
         jmp     sup_out
 hs_alldone:
+        mov     [hub_wait], 16          ; rescan in ~4s if nothing enumerated
         mov     [sup_state], 13
         jmp     sup_out
 
 sup_hubenum:
+        mov     [hub_estage], 1         ; 1 = entered port enum
         ; clear C_PORT_RESET, then bring the downstream device up
         mov     al, 23h
         mov     ah, 01h
@@ -3871,6 +3935,8 @@ sup_hubenum:
         xor     dx, dx
         call    setup_pkt
         mov     [ct_addr], 1
+        mov     al, [hub_mps]
+        mov     [ct_mps], al
         mov     dword ptr [ct_wlen], 0
         call    do_control
         ; is the device low-speed?  (wPortStatus bit9)
@@ -3882,9 +3948,14 @@ sup_hubenum:
         mov     dx, 4
         call    setup_pkt
         mov     [ct_addr], 1
+        mov     al, [hub_mps]
+        mov     [ct_mps], al
         mov     dword ptr [ct_wlen], 4
         call    do_control
         jc      @F
+        movzx   ecx, byte ptr [hub_port]        ; post-reset status (diag)
+        mov     eax, dword ptr [ct_buf]
+        mov     [hub_pstat + ecx*4 - 4], eax
         test    byte ptr [ct_buf+1], 02h
         jz      @F
         mov     byte ptr [dev_ls], 80h  ; LS: preamble on every transaction
@@ -3909,6 +3980,7 @@ sup_hubenum:
         jnz     @F
         mov     al, 8
 @@:     mov     [sup_mps], al           ; downstream ep0 mps
+        mov     [hub_estage], 2         ; 2 = device desc read @ addr 0
         mov     al, 00h                 ; SET_ADDRESS(next)
         mov     ah, 05h
         movzx   bx, byte ptr [hub_naddr]
@@ -3919,6 +3991,7 @@ sup_hubenum:
         mov     dword ptr [ct_wlen], 0
         call    do_control
         jc      he_skip
+        mov     [hub_estage], 3         ; 3 = SET_ADDRESS ok
         ; classify: config descriptor bytes 14 (class) / 16 (protocol)
         mov     al, 80h
         mov     ah, 06h
@@ -3935,6 +4008,7 @@ sup_hubenum:
         jc      he_skip
         cmp     dword ptr [ct_got], 17
         jb      he_skip
+        mov     [hub_estage], 4         ; 4 = classified
         cmp     byte ptr [ct_buf+14], 03h       ; HID only behind the hub
         jne     he_skip
         ; SET_CONFIGURATION 1
@@ -3999,6 +4073,7 @@ he_m2:
         mov     [hd2_pre], al
         mov     [hd2_act], 1
 he_next:
+        mov     [hub_estage], 5         ; 5 = armed / address consumed
         inc     byte ptr [hub_naddr]
 he_skip:
         mov     byte ptr [ct_pre], 0    ; preamble only during LS enum
@@ -4022,6 +4097,19 @@ sup_hubrun:
         jmp     sup_out
 hr_still:
         mov     [sup_absent], 0
+        ; nothing enumerated behind the hub yet?  slow/ganged port power can
+        ; miss the first pass entirely — re-power and rescan every ~4s
+        cmp     [sup_armed], 0
+        jne     sup_out
+        cmp     [hd2_act], 0
+        jne     sup_out
+        dec     [hub_wait]
+        jnz     sup_out
+        inc     [hub_rescan]
+        mov     [hub_conn], 0
+        call    hub_pwr_all
+        mov     byte ptr [hub_port], 1
+        mov     [sup_state], 11
         jmp     sup_out
 
 sup_diskrun:
@@ -4099,6 +4187,34 @@ sup_reidle:                             ; enumeration step failed: retry later
 sup_out:
         ret
 EndProc CFU1_SupTick
+
+;----------------------------------------------------------------------------
+; hub_pwr_all: SET_FEATURE(PORT_POWER) on hub ports 1..hub_nports (hub is
+; always downstream addr 1).  Counts failures in hub_pwrfail for CFU_HUBSTAT.
+;----------------------------------------------------------------------------
+BeginProc hub_pwr_all
+        mov     cl, 1
+hp_next:
+        push    ecx
+        mov     al, 23h
+        mov     ah, 03h
+        mov     bx, 8                   ; PORT_POWER
+        movzx   cx, cl
+        xor     dx, dx
+        call    setup_pkt
+        mov     [ct_addr], 1
+        mov     al, [hub_mps]
+        mov     [ct_mps], al
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        pop     ecx
+        jnc     @F
+        inc     [hub_pwrfail]
+@@:     inc     cl
+        cmp     cl, [hub_nports]
+        jbe     hp_next
+        ret
+EndProc hub_pwr_all
 
 ; sup_start: begin the supervisor if not already running (ESI-safe)
 BeginProc sup_start

@@ -15,7 +15,8 @@ export INCLUDE="$WATCOM/h:$WATCOM/h/nt"
 echo "=== CFU1.VXD ==="
 jwasm -q -coff -D BLD_COFF -D IS_32 -D MASM6 -D DEBLEVEL=0 \
       -Iddkinc -Fo=vxd/CFU1.obj vxd/CFU1.ASM
-wlink system win_vxd option quiet, map=vxd/CFU1.map \
+# NB: must be DYNAMIC or Win98 CreateFile("\\\\.\\...") fails with err 2
+wlink format windows vxd dynamic option quiet, map=vxd/CFU1.map \
       name vxd/CFU1.VXD file vxd/CFU1.obj export CFU1_DDB.1
 
 echo "=== CFUDIAG.EXE ==="

@@ -95,7 +95,7 @@ CFU_IRQTEST     equ 1026h       ; in: BYTE irq; hook+count SOF ints ~1s with
                                 ; exclusive chip ownership, park after;
                                 ; out: DWORD count
 
-VXD_VERSION     equ 00020010h   ; 2.10 - safe one-shot IRQ delivery test
+VXD_VERSION     equ 00020022h   ; 2.22 - PRE for low-speed behind hub
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -1205,7 +1205,9 @@ ioc_ctrl:
         pop     esi
         mov     [xa_pidep], 0D0h
         mov     [xa_len], 8
-        mov     [xa_ctl], 07h           ; ARM|ENABLE|OUT, DATA0
+        mov     al, 07h
+        or      al, [ct_pre]
+        mov     [xa_ctl], al           ; ARM|ENABLE|OUT, DATA0
         call    do_xact_retry
         jc      ctrl_setup_tmo
         test    al, 01h
@@ -1276,7 +1278,9 @@ ctrl_status:
         test    byte ptr [edx+CQ_SETUP], 80h
         jz      ctrl_status_in
         mov     [xa_pidep], 10h         ; OUT status after IN data
-        mov     [xa_ctl], 47h           ; ARM|ENABLE|OUT|DATA1
+        mov     al, 47h
+        or      al, [ct_pre]
+        mov     [xa_ctl], al           ; ARM|ENABLE|OUT|DATA1
         jmp     @F
 ctrl_status_in:
         mov     [xa_pidep], 90h         ; IN status after OUT/no data
@@ -1445,7 +1449,11 @@ am_off:
         ret
 
 ioc_autostat:
-        movzx   eax, [sup_state]
+        movzx   eax, [hub_naddr]        ; b24..: next downstream addr
+        shl     eax, 8
+        mov     al, [hub_port]          ; b16..: port cursor
+        shl     eax, 8
+        mov     al, [sup_state]         ; b8..: state
         shl     eax, 8
         mov     al, 0
         cmp     [sup_run], 0
@@ -2599,7 +2607,9 @@ BeginProc do_control
         pop     esi
         mov     [xa_pidep], 0D0h
         mov     [xa_len], 8
-        mov     [xa_ctl], 07h
+        mov     al, 07h
+        or      al, [ct_pre]
+        mov     [xa_ctl], al
         call    do_xact_retry
         jc      dc_fail
         test    al, 01h
@@ -2668,11 +2678,15 @@ dc_status:
         test    byte ptr [ct_setup], 80h
         jz      dc_status_in
         mov     [xa_pidep], 10h         ; OUT status after IN data
-        mov     [xa_ctl], 47h           ; ARM|ENABLE|OUT|DATA1
+        mov     al, 47h
+        or      al, [ct_pre]
+        mov     [xa_ctl], al           ; ARM|ENABLE|OUT|DATA1
         jmp     dc_st_go
 dc_status_in:
         mov     [xa_pidep], 90h         ; IN status after no data
-        mov     [xa_ctl], 43h           ; ARM|ENABLE|DATA1
+        mov     al, 43h
+        or      al, [ct_pre]
+        mov     [xa_ctl], al           ; ARM|ENABLE|DATA1
 dc_st_go:
         call    do_xact_retry
         jc      dc_fail
@@ -2740,6 +2754,20 @@ vol_busy        db      0               ; an appy-time volume op is queued
 irq_hold        db      0               ; IRQ test owns the chip: req paths wait
 sup_class       db      0               ; classified device class (03/08/09)
 sup_retry       db      0               ; ticks until a mount retry
+hd2_addr        db      0               ; poll slot B (second HID device)
+hd2_ep          db      0
+hd2_mps         db      0
+hd2_mode        db      0               ; 1 = mouse (VMD post only)
+hd2_tog         db      0
+hd2_act         db      0               ; slot B armed
+hub_nports      db      0               ; hub descent state
+hub_port        db      0               ; port being scanned (1-based)
+hub_naddr       db      2               ; next downstream USB address
+hd2_buf         db      8 dup (0)
+ct_pre          db      0               ; 80h = send PRE (LS behind FS hub)
+hid_pre         db      0               ; per-slot preamble bits
+hd2_pre         db      0
+dev_ls          db      0               ; last-enumerated device is LS
 sup_armmode     db      1               ; hid_mode to arm (1=mouse 2=kbd)
 dc_tog          db      0               ; do_control DATA-IN toggle scratch
                 db      1 dup (0)
@@ -3605,6 +3633,12 @@ BeginProc CFU1_SupTick, High_Freq
         je      sup_classify
         cmp     eax, 10
         je      sup_diskrun
+        cmp     eax, 11
+        je      sup_hubscan
+        cmp     eax, 12
+        je      sup_hubenum
+        cmp     eax, 13
+        je      sup_hubrun
         mov     [sup_state], 0
         jmp     sup_out
 
@@ -3742,12 +3776,252 @@ sup_cl_disk:
         mov     [sup_state], 10
         jmp     sup_out
 sup_cl_hub:
-        ; no ring-0 hub descent yet - recognise the hub and park (watch for
-        ; removal) rather than mis-arm it as a mouse; downstream devices need
-        ; the hub layer (TODO).
+        ; hub: read its descriptor, power every port, then scan them one
+        ; per tick (the 250ms cadence provides the settle delays for free)
+        mov     al, 0A0h                ; GET hub descriptor (class)
+        mov     ah, 06h
+        mov     bx, 2900h
+        xor     cx, cx
+        mov     dx, 8
+        call    setup_pkt
+        mov     [ct_addr], 1
+        mov     al, [sup_mps]
+        mov     [ct_mps], al
+        mov     dword ptr [ct_wlen], 8
+        call    do_control
+        jc      sup_reidle
+        cmp     dword ptr [ct_got], 3
+        jb      sup_reidle
+        mov     al, [ct_buf+2]          ; bNbrPorts
+        test    al, al
+        jz      sup_reidle
+        cmp     al, 7
+        jbe     @F
+        mov     al, 7                   ; sanity cap
+@@:     mov     [hub_nports], al
+        mov     byte ptr [hub_port], 1
+        mov     byte ptr [hub_naddr], 2
+        mov     [hd2_act], 0
+        ; SET_FEATURE(PORT_POWER) on every port
+        mov     cl, 1
+hb_pwr: push    ecx
+        mov     al, 23h
+        mov     ah, 03h
+        mov     bx, 8                   ; PORT_POWER
+        movzx   cx, cl
+        xor     dx, dx
+        call    setup_pkt
+        mov     [ct_addr], 1
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        pop     ecx
+        inc     cl
+        cmp     cl, [hub_nports]
+        jbe     hb_pwr
+        mov     [sup_absent], 0
+        mov     [sup_state], 11
+        jmp     sup_out
+
+sup_hubscan:
+        mov     cl, [hub_port]
+        cmp     cl, [hub_nports]
+        ja      hs_alldone
+        ; GET_STATUS(port): 4 bytes; bit0 of byte0 = connected
+        mov     al, 0A3h
+        mov     ah, 00h
+        xor     bx, bx
+        movzx   cx, cl
+        mov     dx, 4
+        call    setup_pkt
+        mov     [ct_addr], 1
+        mov     al, [sup_mps]
+        mov     [ct_mps], al
+        mov     dword ptr [ct_wlen], 4
+        call    do_control
+        jc      hs_next
+        cmp     dword ptr [ct_got], 1
+        jb      hs_next
+        test    byte ptr [ct_buf], 01h
+        jz      hs_next                 ; nothing on this port
+        ; reset it; enumerate on the next tick
+        mov     al, 23h
+        mov     ah, 03h
+        mov     bx, 4                   ; PORT_RESET
+        movzx   cx, byte ptr [hub_port]
+        xor     dx, dx
+        call    setup_pkt
+        mov     [ct_addr], 1
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        mov     [sup_state], 12
+        jmp     sup_out
+hs_next:
+        inc     byte ptr [hub_port]
+        jmp     sup_out
+hs_alldone:
+        mov     [sup_state], 13
+        jmp     sup_out
+
+sup_hubenum:
+        ; clear C_PORT_RESET, then bring the downstream device up
+        mov     al, 23h
+        mov     ah, 01h
+        mov     bx, 14h                 ; C_PORT_RESET
+        movzx   cx, byte ptr [hub_port]
+        xor     dx, dx
+        call    setup_pkt
+        mov     [ct_addr], 1
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        ; is the device low-speed?  (wPortStatus bit9)
+        mov     byte ptr [dev_ls], 0
+        mov     al, 0A3h
+        mov     ah, 00h
+        xor     bx, bx
+        movzx   cx, byte ptr [hub_port]
+        mov     dx, 4
+        call    setup_pkt
+        mov     [ct_addr], 1
+        mov     dword ptr [ct_wlen], 4
+        call    do_control
+        jc      @F
+        test    byte ptr [ct_buf+1], 02h
+        jz      @F
+        mov     byte ptr [dev_ls], 80h  ; LS: preamble on every transaction
+@@:     mov     al, [dev_ls]
+        mov     [ct_pre], al
+        ; device answers at address 0 now
+        mov     al, 80h                 ; GET_DESCRIPTOR(device,8) @ 0
+        mov     ah, 06h
+        mov     bx, 0100h
+        xor     cx, cx
+        mov     dx, 8
+        call    setup_pkt
+        mov     byte ptr [ct_addr], 0
+        mov     byte ptr [ct_mps], 8
+        mov     dword ptr [ct_wlen], 8
+        call    do_control
+        jc      he_skip
+        cmp     dword ptr [ct_got], 8
+        jb      he_skip
+        mov     al, [ct_buf+7]
+        test    al, al
+        jnz     @F
+        mov     al, 8
+@@:     mov     [sup_mps], al           ; downstream ep0 mps
+        mov     al, 00h                 ; SET_ADDRESS(next)
+        mov     ah, 05h
+        movzx   bx, byte ptr [hub_naddr]
+        xor     cx, cx
+        xor     dx, dx
+        call    setup_pkt
+        mov     byte ptr [ct_addr], 0
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        jc      he_skip
+        ; classify: config descriptor bytes 14 (class) / 16 (protocol)
+        mov     al, 80h
+        mov     ah, 06h
+        mov     bx, 0200h
+        xor     cx, cx
+        mov     dx, 18
+        call    setup_pkt
+        mov     al, [hub_naddr]
+        mov     [ct_addr], al
+        mov     al, [sup_mps]
+        mov     [ct_mps], al
+        mov     dword ptr [ct_wlen], 18
+        call    do_control
+        jc      he_skip
+        cmp     dword ptr [ct_got], 17
+        jb      he_skip
+        cmp     byte ptr [ct_buf+14], 03h       ; HID only behind the hub
+        jne     he_skip
+        ; SET_CONFIGURATION 1
+        mov     al, 00h
+        mov     ah, 09h
+        mov     bx, 1
+        xor     cx, cx
+        xor     dx, dx
+        call    setup_pkt
+        mov     al, [hub_naddr]
+        mov     [ct_addr], al
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        ; SET_PROTOCOL(boot)
+        mov     al, 21h
+        mov     ah, 0Bh
+        xor     bx, bx
+        xor     cx, cx
+        xor     dx, dx
+        call    setup_pkt
+        mov     al, [hub_naddr]
+        mov     [ct_addr], al
+        mov     dword ptr [ct_wlen], 0
+        call    do_control
+        cmp     byte ptr [ct_buf+16], 1 ; keyboard?
+        jne     he_mouse
+        cmp     [sup_armed], 0          ; keyboard takes the primary slot
+        jne     he_next                 ; (stateful pipeline lives there)
+        mov     al, [hub_naddr]
+        mov     [hid_addr], al
+        mov     [hid_ep], 1
+        mov     [hid_mps], 8
+        mov     [hid_ivl], 8
+        mov     [hid_mode], 2
+        mov     al, [dev_ls]
+        mov     [hid_pre], al
+        call    hid_arm
+        mov     [sup_armed], 1
+        jmp     he_next
+he_mouse:
+        cmp     [sup_armed], 0          ; mouse: primary if free, else slot B
+        jne     he_m2
+        mov     al, [hub_naddr]
+        mov     [hid_addr], al
+        mov     [hid_ep], 1
+        mov     [hid_mps], 8
+        mov     [hid_ivl], 8
+        mov     [hid_mode], 1
+        mov     al, [dev_ls]
+        mov     [hid_pre], al
+        call    hid_arm
+        mov     [sup_armed], 1
+        jmp     he_next
+he_m2:
+        mov     al, [hub_naddr]
+        mov     [hd2_addr], al
+        mov     [hd2_ep], 1
+        mov     [hd2_mps], 8
+        mov     [hd2_tog], 0
+        mov     [hd2_mode], 1
+        mov     al, [dev_ls]
+        mov     [hd2_pre], al
+        mov     [hd2_act], 1
+he_next:
+        inc     byte ptr [hub_naddr]
+he_skip:
+        mov     byte ptr [ct_pre], 0    ; preamble only during LS enum
+        inc     byte ptr [hub_port]
+        mov     [sup_state], 11
+        jmp     sup_out
+
+sup_hubrun:
+        mov     al, 0Dh                 ; hub still attached?
+        call    sl_rd
+        test    al, 40h
+        jz      hr_still
+        inc     [sup_absent]
+        cmp     [sup_absent], 3
+        jb      sup_out
+        call    hid_stop
+        mov     [hd2_act], 0
         mov     [sup_armed], 0
         mov     [sup_absent], 0
-        mov     [sup_state], 9
+        mov     [sup_state], 0
+        jmp     sup_out
+hr_still:
+        mov     [sup_absent], 0
         jmp     sup_out
 
 sup_diskrun:
@@ -3890,6 +4164,7 @@ BeginProc CFU1_HidTick, High_Freq
         mov     [xa_len], al
         mov     al, [hid_tog]
         or      al, 03h                 ; ARM|ENABLE
+        or      al, [hid_pre]           ; PRE for LS-behind-hub
         mov     [xa_ctl], al
         mov     [xa_budget], 3000       ; short budget at event time
         call    do_xact
@@ -3961,6 +4236,7 @@ ht_nopost:
         and     eax, HIDRING_SLOTS-1
         mov     [hid_tail], eax
 ht_done:
+        call    hid2_poll               ; second device (chip still ours)
         mov     [xbusy], 0
 ht_out:
         ret
@@ -3972,6 +4248,64 @@ ht_noreport:                            ; NAK/timeout: no fresh report
         call    kb_flush
         jmp     ht_done
 EndProc CFU1_HidTick
+
+; hid2_poll: one interrupt-IN poll of slot B (called with xbusy held).
+; Mouse-only dispatch (stateless VMD post); the stateful keyboard pipeline
+; stays on the primary slot.
+BeginProc hid2_poll, High_Freq
+        cmp     [hd2_act], 0
+        jz      h2_out
+        mov     al, [hd2_ep]
+        and     al, 0Fh
+        or      al, 90h
+        mov     [xa_pidep], al
+        mov     al, [hd2_addr]
+        mov     [xa_addr], al
+        mov     al, [hd2_mps]
+        mov     [xa_len], al
+        mov     al, [hd2_tog]
+        or      al, 03h
+        or      al, [hd2_pre]
+        mov     [xa_ctl], al
+        mov     [xa_budget], 3000
+        call    do_xact
+        mov     [xa_budget], 50000
+        jc      h2_out
+        test    al, 01h
+        jz      h2_out
+        xor     [hd2_tog], 40h
+        mov     al, 04h                 ; remaining
+        call    sl_rd
+        mov     ah, [hd2_mps]
+        sub     ah, al
+        movzx   ecx, ah
+        cmp     ecx, 3
+        jb      h2_out                  ; need buttons+dx+dy
+        cmp     ecx, 8
+        jbe     @F
+        mov     ecx, 8
+@@:     push    edi
+        mov     edi, OFFSET32 hd2_buf
+        mov     al, 10h
+        call    buf_from_chip
+        pop     edi
+        test    [hd2_mode], 1
+        jz      h2_out
+        push    ebx
+        push    esi
+        push    edi
+        movzx   ebx, byte ptr [hd2_buf]
+        and     ebx, 7
+        mov     al, [btntab+ebx]
+        movsx   esi, byte ptr [hd2_buf+1]
+        movsx   edi, byte ptr [hd2_buf+2]
+        VxDCall VMD_Post_Pointer_Message
+        pop     edi
+        pop     esi
+        pop     ebx
+h2_out:
+        ret
+EndProc hid2_poll
 
 ;----------------------------------------------------------------------------
 ; keyboard: HID boot report -> scan codes -> VKD_Force_Keys.

@@ -91,8 +91,11 @@ CFU_VOLDOWN     equ 1023h       ; polite teardown; in: BYTE force (skip the
 CFU_VOLSTAT     equ 1024h       ; out: mounted, log_dcb, part_start,
                                 ;      part_len, drive_index
 CFU_IORTRACE    equ 1025h       ; out: DWORD total + 32*(func,flags,lba,cnt)
+CFU_IRQTEST     equ 1026h       ; in: BYTE irq; hook+count SOF ints ~1s with
+                                ; exclusive chip ownership, park after;
+                                ; out: DWORD count
 
-VXD_VERSION     equ 0002000Fh   ; 2.0F - park card IRQ (no latch sharing)
+VXD_VERSION     equ 00020010h   ; 2.10 - safe one-shot IRQ delivery test
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -670,6 +673,8 @@ close_keep:
         je      ioc_volstat
         cmp     eax, CFU_IORTRACE
         je      ioc_iortrace
+        cmp     eax, CFU_IRQTEST
+        je      ioc_irqtest
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -2274,6 +2279,70 @@ ioc_iortrace:
 @@:     xor     eax, eax
         ret
 
+; req_wait_hold: spin (task time, bounded ~2s) while the IRQ test owns the chip
+BeginProc req_wait_hold
+        push    ecx
+        mov     ecx, 2000000
+rwh_l:  cmp     [irq_hold], 0
+        jz      rwh_ok
+        push    ecx
+        mov     ecx, 1                  ; ~1us
+        call    iodelay
+        pop     ecx
+        dec     ecx
+        jnz     rwh_l
+rwh_ok: pop     ecx
+        ret
+EndProc req_wait_hold
+
+; CFU_IRQTEST: one-shot delivery test with exclusive chip ownership.
+; The polled engine is held off (irq_hold + xbusy), the IRQ is hooked and
+; steered, SOF interrupts (already running when a device is mounted) are
+; counted for ~1s, then everything is parked and unhooked again.
+ioc_irqtest:
+        cmp     [enabled], 0
+        je      ioc_notena
+        cmp     [irqhandle], 0
+        jnz     ioc_badbuf              ; already hooked (shouldn't happen)
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbInBuffer], 1
+        jb      ioc_badbuf
+        mov     [irq_hold], 1           ; freeze new IORs out
+        push    ecx
+        mov     ecx, 50000              ; let any in-flight polled work drain
+        call    iodelay
+        pop     ecx
+        cmp     [xbusy], 0
+        jne     itq_busy
+        mov     [xbusy], 1              ; chip is ours alone now
+        movzx   ecx, byte ptr [edx]     ; IRQ number
+        push    esi
+        call    do_irqhook              ; hook + steer PCIC + unmask
+        pop     esi
+        jc      itq_fail
+        push    ecx
+        mov     ecx, 1000000            ; ~1s counting window
+        call    iodelay
+        pop     ecx
+        push    esi
+        call    ioc_unhook              ; VPICD default behaviour again
+        pop     esi
+        mov     al, 60h                 ; re-park the card IRQ at the PCIC
+        mov     ah, 03h
+        call    pcic_wr
+        mov     [xbusy], 0
+        mov     [irq_hold], 0
+        mov     eax, [irqcount]
+        jmp     ret_dword
+itq_fail:
+        mov     [xbusy], 0
+itq_busy:
+        mov     [irq_hold], 0
+        mov     eax, 0FFFFFFFFh
+        jmp     ret_dword
+
 ; CFU_MSCMOUNT: enumerate + read capacity in ring 0; out: blocks, block_size
 ioc_mscmount:
         cmp     [enabled], 0
@@ -2668,6 +2737,7 @@ part_len        dd      0               ; first partition length in sectors
 vol_drive       db      4               ; drive index the volume landed on (E:)
 aep_lgn_save    db      0               ; our load group number (from CONFIG)
 vol_busy        db      0               ; an appy-time volume op is queued
+irq_hold        db      0               ; IRQ test owns the chip: req paths wait
 sup_class       db      0               ; classified device class (03/08/09)
 sup_retry       db      0               ; ticks until a mount retry
 sup_armmode     db      1               ; hid_mode to arm (1=mouse 2=kbd)
@@ -2906,6 +2976,7 @@ req_media:
         je      req_nomedia             ; media gone -> tell the truth
         jmp     req_ok                  ; present, not changed
 req_read:
+        call    req_wait_hold           ; IRQ test window: hold off briefly
         cmp     byte ptr [msc_mounted], 0
         je      req_nomedia
         mov     [xbusy], 1
@@ -2961,6 +3032,7 @@ rr_sgbad:
         mov     [xbusy], 0
         jmp     req_ioerr
 req_write:
+        call    req_wait_hold           ; IRQ test window: hold off briefly
         cmp     byte ptr [msc_mounted], 0
         je      req_nomedia
         mov     [xbusy], 1

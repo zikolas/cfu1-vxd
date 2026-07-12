@@ -47,6 +47,7 @@
 #define CFU_VOLSTAT     0x1024  /* out: mounted, log_dcb, part_start,
                                    part_len, drive_index (5 DWORDs)         */
 #define CFU_IORTRACE    0x1025  /* out: DWORD total + 32*(func,flags,lba,n) */
+#define CFU_IRQTEST     0x1026  /* in: BYTE irq; out: DWORD count (~1s)     */
 
 #pragma pack(push, 1)
 typedef struct {

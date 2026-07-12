@@ -12,19 +12,24 @@ CE drivers for it; this project makes the card work on PCs.
 *The REX-CFU1 with its USB-A dongle, seated in an IBM Microdrive
 CF-to-PC-Card adapter — as tested in a ThinkPad 235.*
 
-Current state: **USB mouse, USB keyboard, and a real read/write drive
-letter for USB sticks, on Windows 98.** Insert the card and Windows
-PnP-installs it (INF + CONFIGMG-integrated VxD, auto-enabled at boot);
-plug a USB mouse into the card at any time and a ring-0 hot-plug
-supervisor enumerates it and feeds Windows' pointer via VMOUSE — no
-commands, hot-unplug/replug safe. USB keyboards work too (one CFUKBD
-command arms a ring-0 feed that types into Windows via VKD, with
-typematic repeat). Plug in a USB stick and the supervisor classifies it
-and auto-mounts it as a real removable drive letter at boot or hot-insert — `DIR E:`, Explorer, reading and writing files (verified byte-exact),
-all through the card (the VxD registers with Windows' I/O Supervisor as
-a port driver and acts as its own TSD; see below). The same VxD exposes
-a full polled USB transfer engine (control + interrupt + bulk) over a
-simple ioctl API.
+Current state: **USB mouse, USB keyboard, USB hubs, and a real
+read/write drive letter for USB sticks, on Windows 98.** Insert the
+card and Windows PnP-installs it (INF + CONFIGMG-integrated VxD,
+auto-enabled at boot); plug in a USB mouse or keyboard — directly or
+through a **self-powered hub** — at any time and a ring-0 hot-plug
+supervisor enumerates it, classifies it, and feeds Windows via
+VMOUSE/VKD: pointer, keys, typematic repeat, no commands. Keyboard and
+mouse work **simultaneously behind a hub**, devices can be yanked and
+replugged freely (per-port teardown and re-enumeration), a keyboard
+always wins the primary slot regardless of enumeration order, and a
+watchdog even recovers hubs whose firmware crashes (see roadmap).
+Plug in a USB stick and the supervisor auto-mounts it as a real
+removable drive letter at boot or hot-insert — `DIR E:`, Explorer,
+reading and writing files (verified byte-exact), all through the card
+(the VxD registers with Windows' I/O Supervisor as a port driver and
+acts as its own TSD; see below). The same VxD exposes a full polled
+USB transfer engine (control + interrupt + bulk) over a simple ioctl
+API.
 
 > ## ⚠️ Proof of concept — not for data you care about
 >
@@ -138,6 +143,11 @@ win/        Windows 95/98 driver + diagnostic
                  VPICD IRQ hook
   diag/CFUDIAG.C Win32 console diagnostic: /ENUM /DETECT /SOF /IRQ /IDS
                  /LIVE /PCIC and more; loads the VxD from its own directory
+  diag/CSTAT.C   supervisor + hub status at a glance: state machine, slot
+                 bindings, per-port wPortStatus, parked mask
+  diag/CHUBT.C   hub interrogator: address sweep (dead engine vs dead
+                 hub), /REENUM clean re-enumeration with per-step SL811
+                 error decode, /WATCH bus-presence oscilloscope
   CFU1.INF       PnP install stub with the verified hardware ID
   build.sh       cross-build on macOS (Open Watcom v2 + JWasm)
   get-ddk.sh     fetch the Windows 98 DDK includes and patch them for JWasm
@@ -189,6 +199,22 @@ CFUDIAG /OFF         power the socket down
 bases, and attribute-window addresses. See TEST-ON-98.md and the source
 for the full switch list.
 
+Hub debugging:
+
+```
+CSTAT                supervisor state + hub ports + slot bindings in one
+                     line each (reads CFU_AUTOSTAT and CFU_HUBSTAT)
+CHUBT                who answers where: control-transfer address sweep +
+                     SL811 register snapshot
+CHUBT /REENUM        stop the supervisor, bus-reset, and re-enumerate the
+                     hub step by step with raw error decode (STALL / NAK /
+                     TIMEOUT per stage); /REENUM n also powers port n and
+                     watches its status; /REENUM /NOPOWER stops short of
+                     port power
+CHUBT /WATCH         sample live bus presence (D+) at 100 ms for 4 s —
+                     catches power-cycle oscillation of overloaded hubs
+```
+
 For the drive letter (⚠️ see the proof-of-concept warning above):
 
 ```
@@ -218,14 +244,37 @@ CPEEK E              enumerate all of IOS's DCBs
 - [ ] Mouse wheel (report-protocol parse + ring-3 helper; Win98's VMOUSE
       service has no Z axis)
 - [x] USB keyboard: ring-0 VKD_Force_Keys injection, HID→scan-code
-      translation, report diffing, typematic synthesis (supervisor
-      auto-detection of keyboard vs mouse still pending)
+      translation, report diffing, typematic synthesis; the supervisor
+      auto-classifies keyboard vs mouse vs disk vs hub from the config
+      descriptor — everything arms itself
 - [x] USB mass storage: Bulk-Only Transport + SCSI, reads a USB stick's
       sectors/partitions/FAT directory (CFUDISK, ring-3 over the VxD's
       bulk-transaction ioctl — verified reading files off a FAT32 drive)
-- [~] USB hubs (hub descent implemented in CFUDISK: port power, reset,
-      downstream re-address — not yet tested; also the road to mouse +
-      keyboard at once)
+- [x] **USB hubs** (self-powered ones): full ring-0 hub descent — hub
+      descriptor, per-port power, reset, downstream enumeration at
+      per-port addresses — plus a continuous port supervisor: hot-plug
+      a device into any hub port and it arms in seconds, yank it and
+      just that slot tears down. **Keyboard + mouse work simultaneously**
+      (keyboard on the primary stateful slot, mouse on slot B), and a
+      keyboard arriving late demotes a mouse that won the enumeration
+      race. A watchdog detects the cheap-hub failure mode where the
+      hub's firmware crashes (control endpoint goes mute while the
+      repeater keeps forwarding) and revives it with a bus reset.
+- [x] Bus-powered hubs: **ruled out by physics, with measurements.** The
+      CF slot supplies roughly one 100 mA device; a hub must feed its
+      controller plus 100 mA per powered port from that same budget. An
+      Apple keyboard hub enumerates fine and then browns out the instant
+      its downstream port power switches on; an unpowered USB 3 hub
+      can't even boot its own controller (caught oscillating at ~500 ms
+      alive / ~1.2 s dead by CHUBT /WATCH). The same USB 3 hub on a
+      bench supply draws 40 mA on its own rail and works perfectly —
+      externally powered hubs are the supported path.
+- [ ] Hub status-change interrupt endpoint: replace the periodic port
+      GET_STATUS polling (the traffic that provokes cheap-hub firmware
+      crashes — currently just throttled to 1 port/s) with the hub's
+      own interrupt IN pipe, which NAKs until a port changes
+- [ ] Low-speed devices behind a full-speed hub: the PRE-preamble path
+      is implemented but has never met real LS hardware
 - [x] **Mass storage → real drive letter**: the VxD is an IOS port
       driver *and* its own TSD — mounts a USB stick as a read/write
       Windows drive letter (verified: DIR, TYPE, file creation through
@@ -243,13 +292,16 @@ CPEEK E              enumerate all of IOS's DCBs
       a CFUEJECT tool (+ /UP remount) are in and mount/read/write is
       solid, but **hot-unplug teardown doesn't fire** (drive letter
       lingers, USB engine wedges until reboot) - the current top bug
-- [ ] Interrupt-driven transfer engine: IRQ7 is now free on the test
-      machine (LPT1 disabled); this replaces the synchronous ring-0 PIO
-      that freezes the UI during copies (currently mitigated by a 4KB
-      transfer cap)
-- [ ] Interrupt-driven operation (IRQ delivery is blocked by chipset IRQ
-      routing on the test machine; INF LogConfig override experiment
-      pending — everything currently runs polled and works)
+- [x] IRQ delivery under Windows: confirmed on the Windows-assigned
+      IRQ 15 (VPICD hook + PCIC steering, ~1400 SOF interrupts/s in the
+      canned CFU_IRQTEST) — with the hard-won rule that an IRQ handler
+      and the polled engine must never share the chip (the SL811's
+      address latch is write-only), so interrupts stay parked until the
+      async engine owns all chip access
+- [ ] Interrupt-driven transfer engine on IRQ 15: replaces the
+      synchronous ring-0 PIO that freezes the UI during copies
+      (currently mitigated by a 4 KB transfer cap); design in
+      win/ASYNC-ENGINE.md
 
 ### On not using Microsoft's USB stack
 

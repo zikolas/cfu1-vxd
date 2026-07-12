@@ -92,7 +92,7 @@ CFU_VOLSTAT     equ 1024h       ; out: mounted, log_dcb, part_start,
                                 ;      part_len, drive_index
 CFU_IORTRACE    equ 1025h       ; out: DWORD total + 32*(func,flags,lba,cnt)
 
-VXD_VERSION     equ 00020007h   ; 2.07 - SG walk bounded by xfer_count
+VXD_VERSION     equ 0002000Bh   ; 2.0B - logical SGD = {sectors, ptr}
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -2784,17 +2784,18 @@ req_read:
 rr_sg:  mov     eax, [ebx + IOP_ior + IOR_xfer_count]
         mov     [sg_left], eax          ; authoritative bound - the SGD
         mov     eax, [ebx + IOP_ior + IOR_buffer_ptr]
-        mov     [sg_cur], eax           ; list may not be null-terminated           ; -> null-terminated SGD list
+        mov     [sg_cur], eax           ; -> {sectors, linear ptr} pairs,
+                                        ; null-terminated (trace-proven)           ; -> null-terminated SGD list
         push    ebx
 rr_sgl: cmp     dword ptr [sg_left], 0
         je      rr_sgok
         mov     edx, [sg_cur]
-        mov     edi, [edx]              ; SG_buff_ptr (linear)
+        mov     edi, [edx+4]            ; logical SGD: ptr is SECOND
         test    edi, edi
         jz      rr_sgok
-        mov     ecx, [edx+4]            ; SG_buff_size in bytes
-        shr     ecx, 9                  ; -> sectors
-        jz      rr_sgnext
+        mov     ecx, [edx]              ; first dword = SECTOR count
+        test    ecx, ecx
+        jz      rr_sgok
         cmp     ecx, [sg_left]
         jbe     @F
         mov     ecx, [sg_left]          ; clamp final segment
@@ -2838,17 +2839,41 @@ req_write:
 rw_sg:  mov     eax, [ebx + IOP_ior + IOR_xfer_count]
         mov     [sg_left], eax          ; authoritative bound - the SGD
         mov     eax, [ebx + IOP_ior + IOR_buffer_ptr]
-        mov     [sg_cur], eax           ; list may not be null-terminated
+        mov     [sg_cur], eax           ; -> {sectors, linear ptr} pairs,
+                                        ; null-terminated (trace-proven)
+        ; evidence: log the first SGD {ptr,size} into the trace ring as a
+        ; pseudo-entry func=0FEh (ptr value alone tells linear vs physical)
+        mov     ecx, [iortr_idx]
+        and     ecx, 31
+        shl     ecx, 4
+        mov     dword ptr [iortr_ring + ecx], 0FEh
+        mov     edx, [eax]              ; SG_buff_ptr
+        mov     [iortr_ring + ecx + 4], edx
+        mov     edx, [eax+4]            ; SG_buff_size
+        mov     [iortr_ring + ecx + 8], edx
+        mov     edx, [ebx + IOP_ior + IOR_xfer_count]
+        mov     [iortr_ring + ecx + 12], edx
+        inc     dword ptr [iortr_idx]
+        mov     ecx, [iortr_idx]        ; second pseudo-entry: dwords 2,3
+        and     ecx, 31
+        shl     ecx, 4
+        mov     dword ptr [iortr_ring + ecx], 0FDh
+        mov     edx, [eax+8]
+        mov     [iortr_ring + ecx + 4], edx
+        mov     edx, [eax+12]
+        mov     [iortr_ring + ecx + 8], edx
+        mov     dword ptr [iortr_ring + ecx + 12], 0
+        inc     dword ptr [iortr_idx]
         push    ebx
 rw_sgl: cmp     dword ptr [sg_left], 0
         je      rw_sgok
         mov     edx, [sg_cur]
-        mov     esi, [edx]
+        mov     esi, [edx+4]            ; logical SGD: ptr is SECOND
         test    esi, esi
         jz      rw_sgok
-        mov     ecx, [edx+4]
-        shr     ecx, 9
-        jz      rw_sgnext
+        mov     ecx, [edx]              ; first dword = SECTOR count
+        test    ecx, ecx
+        jz      rw_sgok
         cmp     ecx, [sg_left]
         jbe     @F
         mov     ecx, [sg_left]          ; clamp final segment

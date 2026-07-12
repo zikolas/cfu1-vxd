@@ -1,8 +1,18 @@
 # Design: interrupt-driven transfer engine (the freeze killer)
 
-Status: **design ready, green-lit by hardware evidence** — not yet built.
-Prerequisite VxD 2.0D (boot-time IRQ hook) is written; deploy + verify
-first (socket must survive a mount, `irqcount` must tick ~1000/s).
+Status: **design ready — with one hard rule learned the expensive way.**
+The 2.0D experiment (hook the IRQ at boot alongside the polled engine)
+**triple-faulted the machine on the first boot with a mounted bus**:
+the SL811's address latch is write-only, so an IRQ handler's own chip
+access corrupts whatever port sequence it preempts — and a hardware
+interrupt preempts even the holder of the `xbusy` guard.  Ironclad
+rule: **the chip has exactly one master at a time.**  The polled engine
+runs with the card IRQ parked at the PCIC (2.0F does this from boot);
+the async engine may enable interrupts only while ALL chip access goes
+through its handler, and must park them again when handing back.
+IRQ delivery itself is still unverified (the earlier "kill = delivery"
+inference was confounded by a laptop suspend).  Stage 1 below verifies
+it safely.
 
 ## Why
 
@@ -80,7 +90,9 @@ task-time) and as a whole-engine fallback when `irqhandle == 0`
 
 ## Build order
 
-1. Deploy + verify 2.0D (socket survives, `irqcount` ticks).
+1. Verify delivery SAFELY: hook + steer + enable only while the bus is
+   otherwise idle (no volume mounted or I/O quiesced), count for 1s,
+   park again — an ioctl-triggered test, not a boot-time state.
 2. Stage A: `do_xact` waits on an IRQ-set memory flag instead of
    port-polling (same synchronous shape, proves handler/engine
    handshake, trivially revertible).

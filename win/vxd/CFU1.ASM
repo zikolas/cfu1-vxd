@@ -92,7 +92,7 @@ CFU_VOLSTAT     equ 1024h       ; out: mounted, log_dcb, part_start,
                                 ;      part_len, drive_index
 CFU_IORTRACE    equ 1025h       ; out: DWORD total + 32*(func,flags,lba,cnt)
 
-VXD_VERSION     equ 0002000Bh   ; 2.0B - logical SGD = {sectors, ptr}
+VXD_VERSION     equ 0002000Ch   ; 2.0C - multipkt ctrl-IN; auto kbd/hub
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -2431,30 +2431,63 @@ BeginProc do_control
         test    al, 01h
         jz      dc_fail
 
-        ; DATA (IN only, single packet)
+        ; DATA IN stage: accumulate multi-packet into ct_buf (toggle
+        ; DATA1/DATA0...), stop on wlen satisfied or a short packet.  The
+        ; old single-packet read couldn't assemble descriptors bigger than
+        ; bMaxPacketSize0, so 18-byte config reads failed on 8-mps devices.
         mov     ecx, [ct_wlen]
-        jecxz   dc_status
+        test    ecx, ecx
+        jnz     dc_din_chk
+        jmp     dc_status
+dc_din_chk:
         test    byte ptr [ct_setup], 80h
-        jz      dc_status
-        mov     al, [ct_mps]
-        mov     [xa_len], al
-        mov     [xa_pidep], 90h         ; IN ep0
-        mov     [xa_ctl], 43h           ; ARM|ENABLE|DATA1
-        call    do_xact_retry
-        jc      dc_fail
-        test    al, 01h
-        jz      dc_fail
-        mov     al, 04h                 ; remaining
-        call    sl_rd
-        mov     ah, [xa_len]
-        sub     ah, al
-        movzx   ecx, ah                 ; ECX = got
-        mov     [ct_got], ecx
+        jnz     dc_din_start
+        jmp     dc_status               ; OUT data-stage: not needed here
+dc_din_start:
+        push    ebx
         push    edi
         mov     edi, OFFSET32 ct_buf
+        mov     ebx, ecx                ; EBX = bytes still wanted
+        mov     byte ptr [dc_tog], 43h  ; ARM|ENABLE|DATA1
+dc_din:
+        test    ebx, ebx
+        jz      dc_din_ok
+        movzx   eax, byte ptr [ct_mps]
+        cmp     eax, ebx
+        jbe     @F
+        mov     eax, ebx
+@@:     mov     [xa_len], al
+        mov     [xa_pidep], 90h         ; IN ep0
+        mov     al, [dc_tog]
+        mov     [xa_ctl], al
+        call    do_xact_retry
+        jc      dc_din_err
+        test    al, 01h
+        jz      dc_din_err
+        mov     al, 04h                 ; SL811 remaining-count
+        call    sl_rd
+        mov     ah, [xa_len]
+        sub     ah, al                  ; AH = bytes got this packet
+        movzx   ecx, ah
+        add     [ct_got], ecx
         mov     al, 10h
-        call    buf_from_chip
+        push    ecx
+        call    buf_from_chip           ; EDI += got
+        pop     ecx
+        sub     ebx, ecx
+        movzx   eax, byte ptr [ct_mps]
+        cmp     ecx, eax
+        jb      dc_din_ok               ; short packet -> transfer done
+        xor     byte ptr [dc_tog], 40h  ; flip DATA toggle
+        jmp     dc_din
+dc_din_ok:
         pop     edi
+        pop     ebx
+        jmp     dc_status
+dc_din_err:
+        pop     edi
+        pop     ebx
+        jmp     dc_fail
 
 dc_status:
         mov     [xa_len], 0
@@ -2530,7 +2563,9 @@ part_len        dd      0               ; first partition length in sectors
 vol_drive       db      4               ; drive index the volume landed on (E:)
 aep_lgn_save    db      0               ; our load group number (from CONFIG)
 vol_busy        db      0               ; an appy-time volume op is queued
-sup_class       db      0               ; classified device class (03/08)
+sup_class       db      0               ; classified device class (03/08/09)
+sup_armmode     db      1               ; hid_mode to arm (1=mouse 2=kbd)
+dc_tog          db      0               ; do_control DATA-IN toggle scratch
                 db      1 dup (0)
 vol_secbuf      db      512 dup (0)     ; MBR parse buffer
 ior_counts      dd      48 dup (0)      ; per-IOR_func counters (0..2Fh)
@@ -3495,8 +3530,8 @@ sup_setcfg:
 
 sup_classify:
         mov     al, 80h                 ; GET_DESCRIPTOR(config,18) @ addr 1:
-        mov     ah, 06h                 ; enough for the first interface
-        mov     bx, 0200h               ; descriptor's bInterfaceClass
+        mov     ah, 06h                 ; reaches bInterfaceClass/Protocol
+        mov     bx, 0200h
         xor     cx, cx
         mov     dx, 18
         call    setup_pkt
@@ -3505,16 +3540,34 @@ sup_classify:
         mov     [ct_mps], al
         mov     dword ptr [ct_wlen], 18
         call    do_control
-        jc      sup_reidle
-        cmp     dword ptr [ct_got], 18
-        jb      sup_reidle
+        mov     byte ptr [sup_armmode], 1       ; default: mouse
+        jc      sup_setproto            ; read failed -> assume HID mouse
+        cmp     dword ptr [ct_got], 17          ; need through byte 16
+        jb      sup_setproto            ; short -> assume HID mouse
         mov     al, [ct_buf+14]         ; bInterfaceClass of interface 0
         mov     [sup_class], al
         cmp     al, 08h                 ; mass storage?
-        jne     sup_setproto            ; anything else: try the HID path
+        je      sup_cl_disk
+        cmp     al, 09h                 ; hub?
+        je      sup_cl_hub
+        cmp     al, 03h                 ; HID?
+        jne     sup_setproto            ; unknown -> mouse default (harmless)
+        cmp     byte ptr [ct_buf+16], 1 ; bInterfaceProtocol 1 = keyboard
+        jne     sup_setproto            ; 2=mouse / other -> mouse
+        mov     byte ptr [sup_armmode], 2       ; keyboard
+        jmp     sup_setproto
+sup_cl_disk:
         call    sched_volup             ; disk: bring the volume up at appy
         mov     [sup_absent], 0
         mov     [sup_state], 10
+        jmp     sup_out
+sup_cl_hub:
+        ; no ring-0 hub descent yet - recognise the hub and park (watch for
+        ; removal) rather than mis-arm it as a mouse; downstream devices need
+        ; the hub layer (TODO).
+        mov     [sup_armed], 0
+        mov     [sup_absent], 0
+        mov     [sup_state], 9
         jmp     sup_out
 
 sup_diskrun:
@@ -3555,7 +3608,8 @@ sup_setproto:
         mov     [hid_addr], 1
         mov     [hid_mps], 8
         mov     [hid_ivl], 8
-        mov     [hid_mode], 1           ; post to VMOUSE
+        mov     al, [sup_armmode]       ; 1=mouse (VMOUSE), 2=keyboard (VKD)
+        mov     [hid_mode], al
         call    hid_arm
         mov     [sup_armed], 1
         mov     [sup_absent], 0

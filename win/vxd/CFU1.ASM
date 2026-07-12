@@ -97,8 +97,13 @@ CFU_IRQTEST     equ 1026h       ; in: BYTE irq; hook+count SOF ints ~1s with
 CFU_HUBSTAT     equ 1027h       ; out: 18 DWORDs: nports, port, naddr, conn,
                                 ; rescan, pwrfail, p2pg, estage, pstat[7],
                                 ; hid_port, hd2_port, parked mask
+CFU_ASYNCA      equ 1028h       ; in: BYTE 1/0 = stage-A IRQ completion
+                                ; on/off; out: DWORD irqcount
+CFU_ASYNCST     equ 1029h       ; out: 4 DWORDs: irqcount, windows completed
+                                ; by IRQ, windows timed out, amode
 
-VXD_VERSION     equ 00020027h   ; 2.27 - watchdog + gentler port scan
+VXD_VERSION     equ 00020036h   ; 2.36 - count-reg guard (the canary killer)
+                                ;        + handler leaves DONE latched
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -592,7 +597,10 @@ BeginProc CFU1_Ioctl
         ret
 @@:     cmp     eax, DIOC_CLOSEHANDLE           ; -1: cleanup on CloseHandle
         jne     @F
+        cmp     [amode], 0                     ; async engine owns a resident
+        jne     cioc_keephook                  ; hook — must outlive the tool
         call    ioc_unhook
+cioc_keephook:
         cmp     [hid_mode], 0           ; any persistent feed (mouse OR
         jne     close_keep              ; keyboard) survives app exit
         call    hid_stop
@@ -680,6 +688,10 @@ close_keep:
         je      ioc_irqtest
         cmp     eax, CFU_HUBSTAT
         je      ioc_hubstat
+        cmp     eax, CFU_ASYNCA
+        je      ioc_asynca
+        cmp     eax, CFU_ASYNCST
+        je      ioc_asyncst
         mov     eax, CFUERR_BADIOCTL
         ret
 EndProc CFU1_Ioctl
@@ -2398,6 +2410,77 @@ itq_busy:
         mov     eax, 0FFFFFFFFh
         jmp     ret_dword
 
+; CFU_ASYNCA: stage-A IRQ-completion mode on/off.  On: hook + steer the
+; Windows-assigned IRQ but keep the PIC masked — do_xact unmasks only
+; inside its wait windows.  Off: unhook and re-park the PCIC.
+ioc_asynca:
+        mov     edx, [esi.lpvInBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbInBuffer], 1
+        jb      ioc_badbuf
+        cmp     byte ptr [edx], 0
+        jz      asa_off
+        cmp     [enabled], 0
+        je      ioc_notena
+        cmp     [pnp_irq], 0FFh
+        je      ioc_badbuf              ; no Windows-assigned IRQ
+        cmp     [irqhandle], 0
+        jnz     asa_on2                 ; already hooked (test tool etc.)
+        movzx   ecx, [pnp_irq]
+        push    esi
+        call    do_irqhook              ; hook + steer PCIC + unmask
+        pop     esi
+        jc      ioc_badbuf
+asa_on2:
+        mov     eax, [irqhandle]        ; masked until a window opens
+        VxDCall VPICD_Physically_Mask
+        mov     dword ptr [awin_ok], 0
+        mov     dword ptr [awin_tmo], 0
+        mov     [amode], 1
+        mov     eax, [irqcount]
+        jmp     ret_dword
+asa_off:
+        mov     [amode], 0
+        mov     [await], 0
+        push    esi
+        call    ioc_unhook
+        pop     esi
+        mov     al, 60h                 ; re-park the card IRQ at the PCIC
+        mov     ah, 03h
+        call    pcic_wr
+        mov     eax, [irqcount]
+        jmp     ret_dword
+
+; CFU_ASYNCST: 7 DWORDs: irqcount, IRQ-completed windows, timeouts, amode,
+; segment-end canary (BEEFCAFE = intact), failing BOT stage, SL811 status
+ioc_asyncst:
+        mov     edx, [esi.lpvOutBuffer]
+        test    edx, edx
+        jz      ioc_badbuf
+        cmp     [esi.cbOutBuffer], 28
+        jb      ioc_badbuf
+        mov     eax, [irqcount]
+        mov     [edx+0], eax
+        mov     eax, [awin_ok]
+        mov     [edx+4], eax
+        mov     eax, [awin_tmo]
+        mov     [edx+8], eax
+        movzx   eax, byte ptr [amode]
+        mov     [edx+12], eax
+        mov     eax, [acanary]
+        mov     [edx+16], eax
+        movzx   eax, byte ptr [bot_stage]
+        mov     [edx+20], eax
+        movzx   eax, byte ptr [bot_st]
+        mov     [edx+24], eax
+        mov     ecx, [esi.lpcbBytesReturned]
+        test    ecx, ecx
+        jz      @F
+        mov     dword ptr [ecx], 28
+@@:     xor     eax, eax
+        ret
+
 ; CFU_MSCMOUNT: enumerate + read capacity in ring 0; out: blocks, block_size
 ioc_mscmount:
         cmp     [enabled], 0
@@ -2582,6 +2665,9 @@ BeginProc do_xact
         mov     al, 0Dh                 ; clear interrupt status
         mov     ah, 0FFh
         call    sl_wr
+        cmp     [amode], 0
+        jnz     dx_async
+dx_go:
         mov     al, 00h                 ; EP A host control: go
         mov     ah, [xa_ctl]
         call    sl_wr
@@ -2599,6 +2685,65 @@ dx_poll:
 dx_done:
         mov     al, 03h                 ; packet status
         call    sl_rd
+        pop     ecx
+        clc
+        ret
+
+        ; stage A: same synchronous shape, but the chip is untouched
+        ; between GO and completion — the IRQ handler reads INTSTAT,
+        ; captures packet status and acks; we spin on a memory flag.
+        ; The PIC is only unmasked inside this window (one-master rule).
+dx_async:
+        cmp     [irqhandle], 0          ; hook gone (teardown): stay polled
+        jz      dx_go
+        mov     al, 06h                 ; INTENA: USB-A done (b0) + SOF gate
+        mov     ah, 11h                 ; (b4) — b0 makes completion assert
+        call    sl_wr                   ; the IRQ pin, else no interrupt
+        mov     [aflag], 0
+        mov     al, 00h                 ; EP A host control: go
+        mov     ah, [xa_ctl]
+        call    sl_wr
+        mov     [await], 1              ; window open: HwInt owns the chip
+        mov     eax, [irqhandle]
+        VxDCall VPICD_Physically_Unmask
+        mov     ecx, [xa_budget]
+dxa_spin:
+        cmp     [aflag], 0
+        jnz     dxa_done
+        in      al, 80h                 ; ~1us
+        loop    dxa_spin
+        mov     eax, [irqhandle]        ; timeout: close the window
+        VxDCall VPICD_Physically_Mask
+        mov     [await], 0
+        cmp     [aflag], 0              ; IRQ landed while we closed?
+        jnz     dxa_late
+        inc     [awin_tmo]
+        mov     al, 0Dh                 ; the chip is ours again: peek —
+        call    sl_rd                   ; a lost edge leaves DONE latched
+        test    al, 01h
+        jz      dxa_hard
+        mov     al, 03h                 ; rescued: status + ack + succeed
+        call    sl_rd
+        mov     [astat], al
+        push    eax
+        mov     al, 0Dh
+        mov     ah, 0FFh
+        call    sl_wr
+        pop     eax
+        pop     ecx
+        clc
+        ret
+dxa_hard:
+        pop     ecx
+        stc
+        ret
+dxa_done:
+        mov     eax, [irqhandle]
+        VxDCall VPICD_Physically_Mask
+        mov     [await], 0
+dxa_late:
+        inc     [awin_ok]
+        mov     al, [astat]             ; packet status, via the handler
         pop     ecx
         clc
         ret
@@ -2835,8 +2980,20 @@ hub_pstat       dd      7 dup (0)       ; last GET_STATUS(port), 1 dword/port
                                         ; (FFFFFFFF = xfer fail, FFFFFFFE short)
 vol_secbuf      db      512 dup (0)     ; MBR parse buffer
 ior_counts      dd      48 dup (0)      ; per-IOR_func counters (0..2Fh)
+amode           db      0               ; stage A: xacts complete via IRQ
+await           db      0               ; window open: HwInt owns the chip
+aflag           db      0               ; HwInt signals completion here
+astat           db      0               ; packet status captured by HwInt
+awin_ok         dd      0               ; windows completed by IRQ (diag)
+awin_tmo        dd      0               ; windows that timed out (diag)
+bot_stage       db      0               ; failing BOT phase: 1=CBW 2=data-out
+                                        ; 3=data-in 4=CSW (0 = no failure)
+bot_st          db      0               ; SL811 status there (FF = timeout)
+                db      2 dup (0)
 iortr_idx       dd      0               ; trace ring write index
 iortr_ring      dd      128 dup (0)     ; 32 x (func, flags, lba, count)
+acanary         dd      0BEEFCAFEh      ; guards the segment end: something
+                                        ; zeroed vars placed here once
 CFU_DDB_SIZE    equ     32              ; = size DDB (header only)
 VxD_LOCKED_DATA_ENDS
 
@@ -3332,7 +3489,7 @@ mbo_l:
         or      al, 40h
 @@:     mov     [xa_ctl], al
         call    do_xact_retry
-        jc      mbo_err
+        jc      mbo_tmo
         test    al, 01h
         jz      mbo_err
         xor     byte ptr [msc_togout], 1
@@ -3341,7 +3498,10 @@ mbo_l:
         jmp     mbo_l
 mbo_ok: clc
         ret
+mbo_tmo:
+        mov     al, 0FFh                ; xact timeout (no status byte)
 mbo_err:
+        mov     [bot_st], al            ; SL811 status at the failure
         stc
         ret
 EndProc msc_bulk_out
@@ -3372,12 +3532,17 @@ mbi_l:
         or      al, 40h
 @@:     mov     [xa_ctl], al
         call    do_xact_retry
-        jc      mbi_err
+        jc      mbi_tmo
         test    al, 01h
         jz      mbi_err
         xor     byte ptr [msc_togin], 1
         mov     al, 04h                 ; SL811 remaining-count register
         call    sl_rd
+        cmp     al, bl                  ; remaining > requested = garbage
+        ja      mbi_badcnt              ; register read: NEVER walk on it —
+                                        ; got would wrap huge and
+                                        ; buf_from_chip then marches through
+                                        ; all of memory (the canary killer)
         mov     ah, bl                  ; AH = requested chunk
         sub     ah, al                  ; AH = got = requested - remaining
         movzx   edx, ah
@@ -3392,7 +3557,13 @@ mbi_l:
         jmp     mbi_l
 mbi_ok: clc
         ret
+mbi_badcnt:
+        mov     al, 0FEh                ; garbage count-register read
+        jmp     mbi_err
+mbi_tmo:
+        mov     al, 0FFh                ; xact timeout (no status byte)
 mbi_err:
+        mov     [bot_st], al            ; SL811 status at the failure
         stc
         ret
 EndProc msc_bulk_in
@@ -3428,7 +3599,8 @@ BeginProc msc_bot
         pop     edi
         pop     esi
 
-        mov     esi, OFFSET32 msc_cbw   ; CBW out
+        mov     byte ptr [bot_stage], 1 ; CBW out
+        mov     esi, OFFSET32 msc_cbw
         mov     ecx, 31
         call    msc_bulk_out
         jc      mbt_fail
@@ -3438,17 +3610,20 @@ BeginProc msc_bot
         jz      mbt_csw
         cmp     byte ptr [msc_dir], 0
         je      mbt_dout
+        mov     byte ptr [bot_stage], 3 ; data in
         mov     edi, [msc_databuf]
         mov     ecx, [msc_datalen]
         call    msc_bulk_in
         jmp     mbt_csw
 mbt_dout:
+        mov     byte ptr [bot_stage], 2 ; data out
         mov     esi, [msc_databuf]
         mov     ecx, [msc_datalen]
         call    msc_bulk_out
 
 mbt_csw:
-        mov     edi, OFFSET32 msc_csw   ; CSW in
+        mov     byte ptr [bot_stage], 4 ; CSW in
+        mov     edi, OFFSET32 msc_csw
         mov     ecx, 13
         call    msc_bulk_in
         jc      mbt_fail
@@ -3457,6 +3632,7 @@ mbt_csw:
         cmp     byte ptr [msc_csw+3], 'S'
         jne     mbt_fail
         mov     al, [msc_csw+12]
+        mov     byte ptr [bot_stage], 0 ; clean run
         clc
         ret
 mbt_fail:
@@ -3605,7 +3781,13 @@ BeginProc msc_mount
         test    eax, eax
         jnz     @F
         mov     eax, 512
-@@:     mov     [msc_bsize], eax
+@@:     cmp     eax, 512                ; ONLY 512-byte-block devices.  A
+        jne     mnt_fail                ; garbled READ CAPACITY here once
+                                        ; inflated datalen and the MBR read
+                                        ; overflowed vol_secbuf into the
+                                        ; next module ("Press any key to
+                                        ; restart" landed on a pointer)
+        mov     [msc_bsize], eax
         mov     byte ptr [msc_mounted], 1
         clc
         ret
@@ -4776,16 +4958,50 @@ EndProc hid_kbd_idle
 ; hardware interrupt handler: ack the SL811, count, EOI
 ;----------------------------------------------------------------------------
 BeginProc CFU1_HwInt, High_Freq
+        ; one-master rule: we may only touch the SL811 when the engine is
+        ; parked in a do_xact wait window (await) or the canned IRQ test
+        ; owns the chip (irq_hold).  Otherwise: count + EOI, nothing else
+        ; (the PIC line is masked outside windows, so no storm).
+        mov     al, [await]
+        or      al, [irq_hold]
+        jz      hw_blind
         push    edx
         movzx   edx, [iobase]
         mov     al, 0Dh                 ; SL811 interrupt status
         out     dx, al
         inc     edx
-        mov     al, 0FEh
-        out     dx, al                  ; ack all but USB-A done (bit0):
-                                        ; the polled engine reads that flag
-        inc     [irqcount]
+        in      al, dx
+        test    al, 01h                 ; USB-A done?
+        jnz     hw_done
+hw_sof:
+        mov     al, 0FEh                ; SOF etc: ack all but USB-A done
+        out     dx, al                  ; (INTSTAT still selected)
+        ; completion can latch between our read and that ack — the pin
+        ; then stays high with no fresh edge and the IRQ is lost.  Re-read.
+        in      al, dx
+        test    al, 01h
+        jz      hw_out
+hw_done:
+        dec     edx                     ; grab EP A packet status for the
+        mov     al, 03h                 ; waiting engine
+        out     dx, al
+        inc     edx
+        in      al, dx
+        mov     [astat], al
+        dec     edx
+        mov     al, 0Dh
+        out     dx, al
+        inc     edx
+        mov     al, 0FEh                ; ack all EXCEPT DONE: the engine's
+        out     dx, al                  ; count/buffer readback needs the
+                                        ; chip in the same state polled mode
+                                        ; sees (DONE latched until the next
+                                        ; xact preamble clears it)
+        mov     [aflag], 1              ; signal the spinning engine
+hw_out:
         pop     edx
+hw_blind:
+        inc     [irqcount]
         mov     eax, [irqhandle]        ; Phys_EOI wants the IRQ handle
         VxDCall VPICD_Phys_EOI
         clc

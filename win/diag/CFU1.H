@@ -52,6 +52,10 @@
                                    conn, rescan, pwrfail, p2pg, estage,
                                    pstat[7] (FFFFFFFF fail, FFFFFFFE short),
                                    hid_port, hd2_port, parked mask          */
+#define CFU_ASYNCA      0x1028  /* in: BYTE 1/0 stage-A IRQ completion
+                                   on/off; out: DWORD irqcount             */
+#define CFU_ASYNCST     0x1029  /* out: 4 DWORDs: irqcount, IRQ-completed
+                                   windows, timeouts, amode                */
 
 #pragma pack(push, 1)
 typedef struct {

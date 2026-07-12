@@ -92,7 +92,7 @@ CFU_VOLSTAT     equ 1024h       ; out: mounted, log_dcb, part_start,
                                 ;      part_len, drive_index
 CFU_IORTRACE    equ 1025h       ; out: DWORD total + 32*(func,flags,lba,cnt)
 
-VXD_VERSION     equ 0002000Ch   ; 2.0C - multipkt ctrl-IN; auto kbd/hub
+VXD_VERSION     equ 0002000Dh   ; 2.0D - hook assigned IRQ from boot
                                 ;        auto-arm, unplug, eject, replug
 
 HIDRING_SLOTS   equ 32
@@ -392,6 +392,10 @@ ch_start_noconf:
         cmp     [enabled], 0            ; if the card came up, watch for a mouse
         jz      @F
         call    sup_start
+        movzx   ecx, [pnp_irq]          ; service the card's IRQ from boot:
+        cmp     cl, 0FFh                ; with LPT1 freed, SOF interrupts
+        je      @F                      ; actually deliver, and unserviced
+        call    do_irqhook              ; storms make Windows kill the socket
 @@:     mov     eax, CR_SUCCESS
         jmp     ch_done
 
@@ -2229,7 +2233,16 @@ ioc_irqhook:
         test    edx, edx
         jz      ioc_badbuf
         movzx   ecx, byte ptr [edx]     ; irq number
+        call    do_irqhook
+        jc      ioc_badbuf
+        xor     eax, eax
+        ret
 
+; do_irqhook: CL = IRQ.  Virtualize via VPICD, steer the PCIC, unmask.
+; CF set on failure.  Idempotent (no-op if already hooked).
+BeginProc do_irqhook
+        cmp     [irqhandle], 0
+        jnz     dih_ok
         mov     [vid.VID_IRQ_Number], cx
         mov     [vid.VID_Options], 0
         mov     [vid.VID_Hw_Int_Proc], OFFSET32 CFU1_HwInt
@@ -2239,10 +2252,12 @@ ioc_irqhook:
         mov     [vid.VID_IRET_Proc], 0
         mov     [vid.VID_IRET_Time_Out], 500
         push    ecx
+        push    edi
         mov     edi, OFFSET32 vid
         VxDCall VPICD_Virtualize_IRQ
+        pop     edi
         pop     ecx
-        jc      ioc_badbuf
+        jc      dih_fail
         mov     [irqhandle], eax
         mov     [irqcount], 0
 
@@ -2255,8 +2270,12 @@ ioc_irqhook:
 
         mov     eax, [irqhandle]
         VxDCall VPICD_Physically_Unmask
-        xor     eax, eax
+dih_ok: clc
         ret
+dih_fail:
+        stc
+        ret
+EndProc do_irqhook
 
 ioc_irqcount:
         mov     eax, [irqcount]
@@ -4042,8 +4061,9 @@ BeginProc CFU1_HwInt, High_Freq
         mov     al, 0Dh                 ; SL811 interrupt status
         out     dx, al
         inc     edx
-        mov     al, 0FFh
-        out     dx, al                  ; ack everything
+        mov     al, 0FEh
+        out     dx, al                  ; ack all but USB-A done (bit0):
+                                        ; the polled engine reads that flag
         inc     [irqcount]
         pop     edx
         mov     eax, [irqhandle]        ; Phys_EOI wants the IRQ handle

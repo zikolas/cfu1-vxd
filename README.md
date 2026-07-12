@@ -20,7 +20,7 @@ supervisor enumerates it and feeds Windows' pointer via VMOUSE — no
 commands, hot-unplug/replug safe. USB keyboards work too (one CFUKBD
 command arms a ring-0 feed that types into Windows via VKD, with
 typematic repeat). Plug in a USB stick and the supervisor classifies it
-and auto-mounts it as a real removable drive letter at boot or hot-insert — `DIR E:`, Explorer, reading *and writing*,
+and auto-mounts it as a real removable drive letter at boot or hot-insert — `DIR E:`, Explorer, reading and writing files (verified byte-exact),
 all through the card (the VxD registers with Windows' I/O Supervisor as
 a port driver and acts as its own TSD; see below). The same VxD exposes
 a full polled USB transfer engine (control + interrupt + bulk) over a
@@ -34,14 +34,19 @@ simple ioctl API.
 > contents you would mind losing.** Strictly testing and fun only.
 > Specifically:
 >
-> * **KNOWN BUG (under debug): file DATA round-trips corrupt** on the
->   current build - directory listings and file creation work, but file
->   contents read back wrong (an LBA-translation asymmetry between
->   metadata and data requests; an IOR trace harness is the next step).
->   A test stick has already been wiped by an earlier form of this bug.
-> * The volume is presented removable/write-through and there is a
->   CFUEJECT tool, but the unplug/eject/replug lifecycle is still being
->   stabilised on real hardware (blue screens were involved).
+> * **Reads and writes are now byte-exact** through VFAT (the earlier
+>   data-corruption bug was a mis-parsed scatter-gather descriptor
+>   format - see below). Copying, editing and creating files on E:
+>   works. Earlier broken builds wiped a couple of test sticks, hence
+>   the standing warning.
+> * **KNOWN BUG: hot-unplug teardown does not fire.** Pulling the stick
+>   (or card) while E: is mounted is *data-safe* (write-through, and the
+>   worst case is the one write in flight) but the drive letter lingers,
+>   an absent-media click wrongly offers to *format*, and the shared USB
+>   engine wedges so a subsequently-inserted mouse isn't picked up until
+>   a reboot. Insert media at boot, and reboot rather than hot-swap, for
+>   now. (Root cause: the detach isn't detected and its failed I/O
+>   leaves the chip-busy guard stuck - one fix clears all three.)
 > * A wrong turn in the IOS layer can hang the whole storage stack —
 >   during development one experiment required a hard reset and assigned
 >   phantom drive letters A: through Z:. That path is gone, but treat
@@ -103,6 +108,16 @@ calldown. Then, three things the DDK does not tell you:
    must honour `IORF_LOGICAL_START_SECTOR` (volume-relative LBAs), and —
    the final trap — **`DCB_DEV_WRITEABLE` (0x02) must be set on both
    DCBs** or VFAT silently mounts the volume write-protected.
+
+And the trap that cost two days: **a logical (memory-mapped) scatter-
+gather list is not the SGD the DDK documents.** When an IOR carries
+`IORF_SCATTER_GATHER`, `IOR_buffer_ptr` points at a null-terminated
+list of `{ sector-count, linear-pointer }` pairs — *sector count
+first*. The DDK's `SGD` struct (`{ pointer, byte-size }`) describes only
+the *physical* variant. VFAT sends FAT and file-data writes scatter-
+gather while directory writes come flat, so mis-reading the format
+corrupts file contents while leaving directory listings perfect — a
+maddening signature until an in-VxD trace ring dumped the raw list.
 
 One more class of bug worth naming, because it bit three separate times:
 the DDK block samples use registers freely, and IOS calls your AER and
@@ -218,12 +233,16 @@ CPEEK E              enumerate all of IOS's DCBs
 - [x] Auto-arm at boot / hot-insert: the supervisor classifies the
       attached device (config descriptor) and brings the volume up at
       appy time - no commands needed
-- [~] Removable-drive lifecycle (WIP, unstable): removable/write-through
-      presentation, detach → fast-fail → `ISP_DCB_DESTROY` teardown,
-      CFUEJECT (+ /UP remount) - **blocked on an LBA-translation bug
-      that corrupts file data** (metadata vs data requests are
-      translated differently; next step is an IOR trace ring to derive
-      the policy from evidence)
+- [x] Byte-exact reads **and writes** through VFAT: the request routine
+      honours both LBA conventions (absolute and volume-relative) and
+      walks Win9x logical scatter-gather lists, whose entries are
+      `{sector-count, linear-pointer}` - *not* the `{pointer, byte-size}`
+      of the DDK's documented (physical) SGD. Mis-reading that format
+      was the whole two-day data-corruption saga.
+- [~] Removable-drive lifecycle: removable/write-through presentation and
+      a CFUEJECT tool (+ /UP remount) are in and mount/read/write is
+      solid, but **hot-unplug teardown doesn't fire** (drive letter
+      lingers, USB engine wedges until reboot) - the current top bug
 - [ ] Interrupt-driven transfer engine: IRQ7 is now free on the test
       machine (LPT1 disabled); this replaces the synchronous ring-0 PIO
       that freezes the UI during copies (currently mitigated by a 4KB

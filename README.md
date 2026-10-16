@@ -1,4 +1,8 @@
-# cfu1-win9x
+# cfu1-vxd
+
+> Renamed from cfu1-win9x in October 2026. This is the parallel-stack VxD
+> route; the successor that puts the card under Windows' own USB stack is
+> [cfu1-hcd](https://github.com/zikolas/cfu1-hcd).
 
 Windows 95/98 driver (and DOS tooling) for the **RATOC REX-CFU1 "USB HOST
 CF+ Card"** — a CompactFlash-sized USB 1.1 host controller card built
@@ -13,7 +17,8 @@ CE drivers for it; this project makes the card work on PCs.
 CF-to-PC-Card adapter — as tested in a ThinkPad 235.*
 
 Current state: **USB mouse, USB keyboard, USB hubs, and a real
-read/write drive letter for USB sticks, on Windows 98.** Insert the
+read/write drive letter for USB sticks, on Windows 95 (OSR2) and
+Windows 98 — one VxD covers both.** Insert the
 card and Windows PnP-installs it (INF + CONFIGMG-integrated VxD,
 auto-enabled at boot); plug in a USB mouse or keyboard — directly or
 through a **self-powered hub** — at any time and a ring-0 hot-plug
@@ -87,6 +92,27 @@ and a ThinkPad 235 under Windows 98) are documented in
   hardware access is silently virtualized; the OS PCMCIA layer races
   socket enables and shuts down sockets with unserviced interrupts
 
+## One VxD for both Windows 95 and 98
+
+The same `CFU1.VXD` runs on Windows 95 (OSR2, verified) and Windows 98.
+The one rule that makes this work: **build for the older OS.** A VxD's
+DDB carries a `DDB_SDK_Version` stamp, and the loader treats it as a
+*minimum* — Windows 98 happily loads a VxD that only asks for the 95
+DDK level, but Windows 95 **rejects** a VxD stamped with the newer 98
+level. The symptom of getting this backwards is nasty and non-obvious:
+the INF installs, the file is present, `CreateFile` can even open it,
+but the PnP devnode won't start — Device Manager shows a yellow "?"
+with a system-error code, and nothing hints at "wrong version stamp."
+
+So `win/build.sh` assembles with `-D WIN40COMPAT`, which stamps the
+DDB `0x0400` (Windows 95 DDK) instead of the Win98 default `0x040A`.
+Nothing else changes — the code is identical; the version word is a
+runtime no-op — so one binary serves the whole Win9x range. (Aside: the
+linker is not byte-reproducible, so two builds of the same source differ
+in thousands of bytes of relocation data; don't be alarmed by a large
+`cmp` between builds. The build script verifies the two things that
+matter: the DYNAMIC flag and the `0x0400` stamp.)
+
 ## How the drive letter works (undocumented IOS findings)
 
 Windows 9x block storage is the IOS (I/O Supervisor) stack: port driver
@@ -118,6 +144,17 @@ calldown. Then, three things the DDK does not tell you:
    the final trap — **`DCB_DEV_WRITEABLE` (0x02) must be set on both
    DCBs** or VFAT silently mounts the volume write-protected.
 
+**Which drive letter?** The VxD asks for **E:** first, and if
+`ISP_ASSOCIATE_DCB` reports it taken, walks upward (F:, G:, … up to J:)
+and takes the first letter IOS accepts. E: is the default because the
+usual layout is C: = hard disk, D: = CD, so E: is the first free slot.
+Caveat: this only avoids collisions with **IOS-managed (block-device)**
+letters — other USB/hard-disk/removable drives. It does *not* see
+real-mode MSCDEX CD-ROM letters, network-redirector drives, or `SUBST`,
+so on a machine where one of those holds E: a collision is possible.
+(Planned hardening: query IFSMGR — which does see redirector letters —
+for a genuinely free letter before associating.)
+
 And the trap that cost two days: **a logical (memory-mapped) scatter-
 gather list is not the SGD the DDK documents.** When an IOR carries
 `IORF_SCATTER_GATHER`, `IOR_buffer_ptr` points at a null-terminated
@@ -141,6 +178,11 @@ dos/        DOS tools (build with Open Watcom 1.9+, 16-bit)
   CISDUMP.C   dump any PC Card's CIS via an 82365-compatible controller
   CFUPROBE.C  enable + identify + RAM test + detect + SOF + IRQ test
   CFUENUM.C   bus reset + GET_DESCRIPTOR control transfer (needs CFUPROBE)
+  UMOUSE.C    INT 33h mouse driver TSR - a USB boot-protocol mouse as a
+              real-mode DOS mouse (enable + enumerate + SOF-IRQ poll).
+              WORK IN PROGRESS: foreground report capture is byte-perfect
+              but interrupt-context polling is still erratic - see the
+              header comment.
 win/        Windows 95/98 driver + diagnostic
   vxd/CFU1.ASM   dynamically loadable VxD: ring-0 socket enable (with the
                  COR-at-0xFC quirk), SL811 register/attr access ioctls,
@@ -170,12 +212,17 @@ required on the target:
    Archive and extracts + patches the VMM/VPICD/etc. includes for JWasm
    (they are Microsoft-copyrighted, so they are not in this repo; the
    patch pipeline is verified byte-reproducible).
-3. `win/build.sh` — produces `CFU1.VXD` and `CFUDIAG.EXE`.
+3. `win/build.sh` — produces `CFU1.VXD` and `CFUDIAG.EXE`. The VxD is
+   assembled `-D WIN40COMPAT` so its DDB stamps the Windows 95 DDK level
+   and the one binary loads on both 95 and 98 (see *One VxD for both
+   Windows 95 and 98* above); the script sanity-checks the DYNAMIC flag
+   and the version stamp before finishing.
 
 The DOS tools build on any DOS box with Open Watcom
-(`wcc -ms` + `wlink system dos`).
+(`wcc -ms` + `wlink system dos`), or cross-build the same way as the
+Windows pieces.
 
-## Using it on Windows 98
+## Using it on Windows 95 / 98
 
 Copy `win/dist/CFU1.VXD` and `CFUDIAG.EXE` to the same directory on the
 target machine, insert the card, and:
@@ -237,6 +284,10 @@ CPEEK E              enumerate all of IOS's DCBs
 - [x] DOS proof: enable, SOF, IRQ delivery, control transfers
 - [x] Win98 VxD: ring-0 enable, register access, IRQ hook, ioctl API
 - [x] Win98 proof: device descriptor read through the VxD
+- [x] Windows 95 (OSR2) support: one `WIN40COMPAT` VxD loads and runs on
+      both 95 and 98 (USB mouse verified on a PC110 under OSR2); the DDB
+      version stamp was the whole trick — see *One VxD for both Windows
+      95 and 98*
 - [x] PnP INF + CONFIGMG integration: auto-install, auto-enable at boot,
       Windows-assigned resources (COR quirk applied in CONFIG_START)
 - [x] Ring-0 transfer engine (control + interrupt transfers, NAK retry,
@@ -336,11 +387,38 @@ small USB stack by necessity, not preference. The full analysis is in
       project with real risk. The pragmatic hub + mass-storage work above
       reaches the same user-visible goals without it.
 
+## How this was built: COMrade
+
+Every result in this project — the hardware probing, the ring-0 VxD work,
+the undocumented-IOS spelunking, all of it — was done **remotely, on real
+period hardware, through COMrade.**
+COMrade is the serial bridge that makes an IBM PC110 or a ThinkPad 235 a
+fully instrumentable target: a tiny resident agent (`COMRADE.EXE`) on the
+DOS/Windows box, spoken to over COM1, exposes exactly the primitives this
+kind of work needs —
+
+* run a command and capture its output; inject keystrokes into a
+  full-screen app or game;
+* transfer files in and out with end-to-end CRC verification (build on a
+  modern machine, stream the binary straight to the box);
+* read and write physical memory and I/O ports, and read the text screen —
+  so a driver can be poked, a DCB dumped, or a crash decoded live;
+* reboot and reconnect, so a bluescreen is a 40-second round trip rather
+  than a trip across the room.
+
+Without it, none of this would have been remotely practical — a VxD that
+bluescreens the machine, on hardware with no other I/O path, is not
+something you debug with a screwdriver and a reboot each time. COMrade
+turned the retro box into something you can script. It is the main enabler
+of the whole project.
+
 ## References
 
 * Cypress SL811HS datasheet (38-08008) and the Linux `sl811-hcd` /
   `sl811_cs` drivers — the reference implementations for this chip
 * [RATOC's CFU1U FAQ](http://www.ratocsystems.com/english/support/faq/cfu1u.html)
+* Deep-dive notes: [why the driver doesn't use Windows' own USB stack](docs/why-not-the-windows-usb-stack.pdf)
+  and [being your own IOS port driver and TSD](docs/being-your-own-ios-tsd.pdf)
 
 ## License
 
